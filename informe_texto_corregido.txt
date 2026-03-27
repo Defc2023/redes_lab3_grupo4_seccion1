@@ -1,0 +1,260 @@
+Lab Redes y Servicios de Comunicaciones: Informe Laboratorio 3
+
+Integrantes:
+Nombre: Sofia Arias Zuluaga | Codigo: 202310260 | Correo: s.ariasz2@uniandes.edu.co
+Nombre: David Elias Forero Cobos | Codigo: 202310499 | Correo: de.foreroc1@uniandes.edu.co
+Nombre: Sara Garcia Agudelo | Codigo: 202320378 | Correo: s.garcia11234@uniandes.edu.co
+
+========================================
+COMPARACION DE DESEMPENO TCP, UDP Y QUIC HIBRIDO
+========================================
+
+[TABLA COMPARATIVA - mantener formato de tabla]
+
+Criterio | TCP | UDP | QUIC Hibrido
+---------|-----|-----|---------------
+Confiabilidad | Alta. Garantia de entrega mediante ACKs y retransmisiones automaticas gestionadas por el sistema operativo. En la captura se observaron 0 paquetes perdidos y 0 retransmisiones, lo cual confirma que TCP garantizo la entrega completa de todos los segmentos. | Nula a nivel de protocolo. No hay ACKs ni retransmisiones. Si un paquete se pierde en la red, nunca llega al destino y el emisor no se entera. En la captura tampoco hubo perdidas, pero esto se debe al entorno loopback; en una red real no habria mecanismo alguno para recuperar paquetes perdidos. | Alta, implementada a nivel de aplicacion. Cada mensaje genera un ACK explicito con formato "ACK|seq". Si el ACK no llega en 500 ms, el mensaje se retransmite hasta 3 veces. En la captura se registraron 0 paquetes perdidos y 0 retransmisiones, confirmando que el mecanismo funciona correctamente.
+Orden de entrega | Garantizado. TCP reordena internamente los paquetes que llegan fuera de orden antes de entregarlos a la aplicacion. El suscriptor siempre recibe los mensajes en el orden en que fueron enviados, como se verifico en las capturas de terminal donde los 12 eventos aparecen en secuencia correcta. | No garantizado. Los datagramas pueden llegar en orden diferente al de envio. En el entorno loopback no se observo desorden, pero en redes reales con multiples saltos y diferentes rutas, los paquetes pueden llegar desordenados sin que el protocolo los reordene. | Garantizado a nivel de aplicacion. Cada mensaje incluye un numero de secuencia (seq=1, seq=2, ...). El suscriptor detecta desorden y duplicados verificando el seq contra el esperado, como se observa en las capturas de terminal donde cada mensaje muestra su numero de secuencia.
+Perdida de mensajes | Ninguna bajo condiciones normales. TCP detecta perdidas por timeout o ACK duplicados y retransmite automaticamente los segmentos faltantes. | Posible. Si la red descarta un paquete o el buffer del receptor esta lleno, el mensaje se pierde permanentemente sin notificacion al emisor. | Ninguna (con reintentos). Si el ACK no llega en 500 ms, el broker reenvia el mensaje. Tras 3 fallos consecutivos se reporta el mensaje como no confirmado, lo que permite al sistema tomar acciones correctivas.
+Overhead de cabeceras/protocolo | Mayor. La cabecera TCP tiene un minimo de 20 bytes (sin opciones) pero en la practica se observaron ~32 bytes promedio debido a opciones como timestamps. Sumada a la cabecera IP (20 bytes), cada paquete tiene al menos 52 bytes de overhead. Ademas, el three-way handshake agrega 3 paquetes iniciales y los ACKs automaticos duplican el trafico de control. | Minimo. La cabecera UDP tiene solo 8 bytes (puerto origen, puerto destino, longitud, checksum) mas 20 bytes de cabecera IP, totalizando 28 bytes de overhead. No hay handshake ni ACKs, por lo que el primer paquete enviado ya contiene datos utiles. | Bajo. Misma cabecera UDP de 8 bytes + IP de 20 bytes = 28 bytes base. Los ACKs de aplicacion agregan paquetes adicionales de ~5 bytes de payload ("ACK|N"), lo que representa un overhead menor que los ACKs automaticos de TCP.
+Paquetes totales | 150 | 63 | 74
+Bytes totales | 12,342 | 5,814 | 5,046
+Duracion captura | 50.6 s | 43.7 s | 39.2 s
+Paquetes utiles (datos de negocio) | 63 de 150 (42%) - el 58% restante son ACKs TCP, SYN y FIN | 63 de 63 (100%) - cero paquetes de control | 38 de 74 (51.4%) - 2 SUB + 12 PUB + 24 MSG. Los otros 36 son ACKs de aplicacion.
+Establecimiento de conexion | Three-way handshake (SYN, SYN+ACK, ACK): 3 paquetes por conexion antes de poder enviar datos | Ninguno. El primer paquete ya contiene datos | Ninguno. Como UDP, el primer paquete ya contiene datos.
+Deteccion de desconexion | Automatica. recv() retorna 0 o error ECONNRESET cuando el otro extremo cierra la conexion o se cae | No detecta. recvfrom() queda bloqueado indefinidamente esperando datagramas que nunca llegan | Parcial. El emisor detecta fallo tras 3 ACKs sin respuesta (1.5 s total). El receptor no tiene mecanismo automatico de deteccion.
+
+========================================
+EJECUCION TCP - 5 TERMINALES
+========================================
+
+A continuacion se presenta la ejecucion del sistema publicador-suscriptor sobre TCP. Se utilizaron 5 terminales: un broker escuchando en el puerto 5555, dos suscriptores (uno suscrito a un tema y otro a dos temas) y dos publicadores, cada uno publicando eventos de un partido diferente. Cada publicador envio 12 eventos deportivos con una pausa de 2 segundos entre cada uno para simular el tiempo real de un partido.
+
+T1: ./broker_tcp 5555
+[Insertar captura de terminal del broker TCP]
+
+T2: ./subscriber_tcp 127.0.0.1 5555 EquipoA_vs_EquipoB
+[Insertar captura de terminal del suscriptor 1]
+
+T3: ./subscriber_tcp 127.0.0.1 5555 EquipoA_vs_EquipoB EquipoC_vs_EquipoD
+[Insertar captura de terminal del suscriptor 2]
+
+T4: ./publisher_tcp 127.0.0.1 5555 EquipoA_vs_EquipoB
+[Insertar captura de terminal del publicador 1]
+
+T5: ./publisher_tcp 127.0.0.1 5555 EquipoC_vs_EquipoD
+[Insertar captura de terminal del publicador 2]
+
+En la ejecucion TCP se puede observar que el suscriptor 1, suscrito unicamente a EquipoA_vs_EquipoB, recibio exactamente los 12 mensajes de ese partido. El suscriptor 2, suscrito a ambos temas, recibio los 24 mensajes (12 de cada partido), todos en el orden correcto de envio. El broker mostro en su log cada mensaje publicado junto con la cantidad de suscriptores a los que fue reenviado. Al finalizar, cuando los publicadores cerraron su conexion con close(), el broker detecto automaticamente la desconexion (recv() retorno 0) y removio los file descriptors correspondientes.
+
+========================================
+EJECUCION UDP - 5 TERMINALES
+========================================
+
+Para la version UDP se utilizo la misma configuracion: un broker en el puerto 5556, dos suscriptores y dos publicadores. A diferencia de TCP, aqui no existe conexion persistente. Cada mensaje es un datagrama independiente enviado con sendto() y recibido con recvfrom(). Los suscriptores envian primero un datagrama "SUBSCRIBE|tema" y luego quedan esperando los mensajes del broker.
+
+T1: ./broker_udp 5556
+[Insertar captura de terminal del broker UDP]
+
+T2: ./subscriber_udp 127.0.0.1 5556 EquipoA_vs_EquipoB
+[Insertar captura de terminal del suscriptor 1]
+
+T3: ./subscriber_udp 127.0.0.1 5556 EquipoA_vs_EquipoB EquipoC_vs_EquipoD
+[Insertar captura de terminal del suscriptor 2]
+
+T4: ./publisher_udp 127.0.0.1 5556 EquipoA_vs_EquipoB
+[Insertar captura de terminal del publicador 1]
+
+T5: ./publisher_udp 127.0.0.1 5556 EquipoC_vs_EquipoD
+[Insertar captura de terminal del publicador 2]
+
+En la ejecucion UDP, ambos suscriptores recibieron todos los mensajes correspondientes a sus temas de interes: 12 mensajes el suscriptor 1 y 24 el suscriptor 2. En este entorno loopback (127.0.0.1) no se observo perdida ni desorden de paquetes, ya que los datagramas no atraviesan ninguna red fisica. Sin embargo, es importante destacar que UDP no ofrece ningun mecanismo para detectar o corregir perdidas si estas ocurrieran en una red real. A diferencia de TCP, no hubo handshake inicial ni paquetes de control adicionales, lo que resulta en una comunicacion mas ligera.
+
+========================================
+EJECUCION QUIC HIBRIDO - 4 TERMINALES
+========================================
+
+Como trabajo adicional, implementamos una version hibrida inspirada en el protocolo QUIC. Esta version utiliza sockets UDP como transporte base, pero agrega a nivel de aplicacion tres mecanismos de confiabilidad: ACKs explicitos por cada mensaje, retransmision con timeout de 500 ms (hasta 3 intentos), y numeros de secuencia para garantizar el orden. Se utilizaron 4 terminales: un broker en el puerto 5557, dos suscriptores y un publicador.
+
+T1: ./broker_quic 5557
+[Insertar captura de terminal del broker QUIC]
+
+T2: ./subscriber_quic 127.0.0.1 5557 EquipoE_vs_EquipoF
+[Insertar captura de terminal del suscriptor 1]
+
+T3: ./subscriber_quic 127.0.0.1 5557 EquipoE_vs_EquipoF
+[Insertar captura de terminal del suscriptor 2]
+
+T4: ./publisher_quic 127.0.0.1 5557 EquipoE_vs_EquipoF
+[Insertar captura de terminal del publicador]
+
+El flujo completo de un mensaje en la version QUIC (por ejemplo, seq=2) es el siguiente:
+1. Publisher envia al Broker: PUBLISH|2|EquipoE_vs_EquipoF|Gol de Equipo E al minuto 3 - Marcador 1-0
+2. Broker responde al Publisher: ACK|2
+3. Broker envia al Suscriptor 1: MSG|2|[EquipoE_vs_EquipoF] Gol de Equipo E al minuto 3 - Marcador 1-0
+4. Suscriptor 1 responde al Broker: ACK|2
+5. Broker envia al Suscriptor 2: MSG|2|[EquipoE_vs_EquipoF] Gol de Equipo E al minuto 3 - Marcador 1-0
+6. Suscriptor 2 responde al Broker: ACK|2
+
+El publicador confirmo 12/12 mensajes enviados con 0 fallos. Ambos suscriptores recibieron los 12 mensajes en orden secuencial correcto (seq=1 a seq=12). Este resultado demuestra que es posible lograr confiabilidad comparable a TCP usando UDP como transporte, mediante mecanismos implementados a nivel de aplicacion.
+
+========================================
+ANALISIS DE CAPTURAS WIRESHARK
+========================================
+
+Se capturo el trafico de las tres versiones del sistema utilizando Wireshark. A continuacion se analiza cada captura.
+
+--- Captura TCP (tcp_pubsub.pcap) ---
+
+[Insertar captura de pantalla de Wireshark TCP]
+
+En la captura TCP se observan claramente las fases del protocolo. Los paquetes 1 a 3 corresponden al three-way handshake (SYN, SYN+ACK, ACK) que establece la conexion entre el primer cliente y el broker. Este intercambio de 3 paquetes ocurre antes de que se pueda transmitir cualquier dato, lo cual introduce latencia inicial. A continuacion, el paquete 5 muestra un segmento con datos (flags PSH, ACK) que contiene la solicitud de suscripcion, y el paquete 6 es su ACK correspondiente.
+
+Los paquetes 7-9 y 15-17 corresponden a los handshakes de los demas clientes que se van conectando al broker. En total, se necesitaron 9 paquetes solo para establecer las conexiones de los clientes, sin haber transmitido aun ningun evento deportivo.
+
+En cuanto a la confiabilidad, cada segmento de datos enviado por el broker a los suscriptores recibe un ACK del receptor. Esto se puede observar en los campos Seq y Ack de cada paquete. No se observaron retransmisiones (no aparecen paquetes marcados como "TCP Retransmission"), lo que confirma que todos los segmentos llegaron correctamente en el primer intento.
+
+Respecto al control de flujo, se observa el campo Window Size en cada paquete, con valores de Win=488128 bytes. Este valor indica que el receptor tiene suficiente espacio en su buffer para recibir datos, por lo que el emisor no necesito reducir su tasa de envio. En un escenario con mas trafico, TCP ajustaria automaticamente la ventana para evitar saturar al receptor.
+
+La captura registra un total de 150 paquetes y 12,342 bytes. De esos 150 paquetes, solo 63 (42%) contienen datos de aplicacion; el resto son paquetes de control (ACKs puros, SYN, FIN).
+
+--- Captura UDP (udp_pubsub.pcap) ---
+
+[Insertar captura de pantalla de Wireshark UDP]
+
+La captura UDP presenta un contraste notorio con TCP. El primer paquete (paquete #1) ya contiene datos de aplicacion: la solicitud de suscripcion del primer suscriptor. No hay handshake previo. Cada datagrama es completamente independiente.
+
+En la barra de detalle de Wireshark se observa la cabecera UDP, que contiene unicamente 4 campos: Source Port, Destination Port, Length y Checksum, totalizando solo 8 bytes. Esto es significativamente menor que la cabecera TCP, que requiere como minimo 20 bytes y en la practica se observaron ~32 bytes promedio por las opciones de timestamps.
+
+No se observan paquetes de confirmacion (ACK) ni de control de ningun tipo. Cada paquete es un datagrama independiente que va del emisor al receptor sin confirmacion. Si alguno de estos paquetes se perdiera, ni el emisor ni el receptor tendrian forma de saberlo a nivel de protocolo.
+
+En esta captura, los 63 paquetes registrados (5,814 bytes en total) son 100% datos utiles. No hay overhead de control, lo que hace a UDP considerablemente mas eficiente en terminos de ancho de banda para este tipo de mensajes cortos y frecuentes.
+
+No se observaron evidencias de perdida ni desorden en los mensajes. Esto es esperable en un entorno loopback donde los datagramas no atraviesan interfaces de red fisicas ni routers. En una red real con congestion o multiples saltos, la situacion seria diferente y se podrian observar perdidas y desorden.
+
+--- Captura QUIC (quic_pubsub.pcap) ---
+
+[Insertar capturas de pantalla de Wireshark QUIC]
+
+La captura QUIC muestra datagramas UDP (ya que QUIC se transporta sobre UDP) con un patron de trafico diferente a UDP puro. Se observan tres tipos de paquetes segun su contenido:
+
+- Paquetes de suscripcion (los primeros datagramas de cada suscriptor con contenido "SUBSCRIBE|tema").
+- Paquetes de datos (PUBLISH del publicador al broker, y MSG del broker a los suscriptores), que contienen el numero de secuencia y el mensaje.
+- Paquetes de ACK (respuestas cortas de ~5 bytes con formato "ACK|N"), que confirman la recepcion de cada mensaje.
+
+En la captura se puede ver, por ejemplo, el paquete #4 con 37 bytes y contenido "ACK|1", que es la confirmacion del suscriptor al broker por el primer mensaje recibido. Tambien se observan los paquetes de datos mas grandes (60-100+ bytes) que contienen los mensajes con sus numeros de secuencia.
+
+Estadisticas de la captura:
+- Total de paquetes: 74
+- Total de bytes: 5,046
+- Duracion: 39.2 segundos
+- 3 flujos UDP (2 suscriptores + 1 publicador, todos al broker en puerto 5557)
+
+Comparando con las otras capturas, QUIC usa 74 paquetes frente a los 150 de TCP (51% menos) y 5,046 bytes frente a los 12,342 de TCP (59% menos), mientras logra la misma confiabilidad. Respecto a UDP puro (63 paquetes), el overhead adicional de QUIC son solo 11 paquetes extra (los ACKs de aplicacion), un incremento del 17.5%.
+
+--- Diferencias en el manejo de la conexion ---
+
+La diferencia mas visible entre los protocolos es el establecimiento de conexion. En TCP, se requiere un three-way handshake de 3 paquetes (SYN, SYN+ACK, ACK) antes de transmitir cualquier dato. En la captura esto se observa en los primeros paquetes de cada nueva conexion. En UDP y QUIC, el primer paquete ya contiene datos utiles, sin fase de establecimiento.
+
+Otra diferencia importante es la deteccion de desconexion. En TCP, cuando un publicador termina y ejecuta close(), se envia un paquete FIN que el broker detecta inmediatamente (recv() retorna 0). En UDP, no hay notificacion de desconexion: si un publicador deja de enviar, el broker simplemente deja de recibir datagramas sin saber si el emisor termino o si hubo un fallo. En QUIC, la deteccion es parcial: el emisor puede detectar que el receptor no responde si no recibe ACKs tras los reintentos.
+
+========================================
+PREGUNTAS DE ANALISIS
+========================================
+
+1. Que ocurriria si en lugar de dos publicadores hubiera cien partidos simultaneos? Como impactaria esto en el desempeno del broker bajo TCP y bajo UDP?
+
+Bajo TCP, 100 partidos con varios publicadores y suscriptores cada uno generarian cientos de conexiones persistentes simultaneas. Cada conexion consume un file descriptor del sistema operativo, y el broker implementado con select() tiene un limite duro de FD_SETSIZE (~1024 en la mayoria de sistemas). Con muchos clientes, seria necesario migrar a mecanismos mas escalables como epoll() en Linux. Ademas, cada nueva conexion requiere un three-way handshake que anade latencia y trafico de control extra. En cada iteracion del bucle principal, select() debe revisar todos los file descriptors activos, lo cual tiene complejidad O(n) y se vuelve ineficiente con muchas conexiones.
+
+Bajo UDP, todos los clientes comparten un unico socket en el broker. No hay estados de conexion, ni limite de file descriptors por cliente. El broker simplemente recibe datagramas con recvfrom() y los reenvio con sendto() a las direcciones registradas en su tabla de suscriptores. El cuello de botella seria el ancho de banda y la capacidad de procesamiento de la CPU, no los limites del sistema de sockets. Esto lo hace considerablemente mas escalable en este escenario.
+
+
+2. Si un gol se envia como mensaje desde el publicador y un suscriptor no lo recibe en UDP, que implicaciones tendria para la aplicacion real? Por que TCP maneja mejor este escenario?
+
+Si el mensaje de un gol se pierde en UDP, el suscriptor nunca lo recibe. No existe mecanismo de deteccion ni retransmision a nivel de protocolo: el marcador en la pantalla del usuario cambiaria directamente al siguiente estado sin que el usuario vea el evento del gol. Por ejemplo, el usuario podria ver que el marcador paso de 0-0 a 1-0 sin ningun aviso de que se anoto un gol. En una aplicacion real de noticias deportivas, perder un evento critico como un gol es inaceptable.
+
+TCP maneja mejor este caso porque detecta automaticamente la perdida de segmentos mediante los ACKs. Cuando el receptor no confirma la recepcion de un segmento, TCP lo retransmite tras un timeout. En la captura tcp_pubsub.pcap no se observo ninguna retransmision porque no hubo perdidas en loopback, pero el mecanismo esta siempre activo y garantizaria la entrega en una red real con congestion.
+
+En nuestra implementacion QUIC, este problema tambien se resuelve a nivel de aplicacion: el broker espera un ACK del suscriptor por cada mensaje y retransmite hasta 3 veces si no lo recibe, garantizando que el gol llegue sin depender de TCP.
+
+
+3. En un escenario de seguimiento en vivo de partidos, que protocolo (TCP o UDP) resultaria mas adecuado? Justifique con base en los resultados de la practica.
+
+TCP es mas adecuado cuando la integridad de la informacion es prioritaria. Los eventos deportivos criticos (goles, tarjetas, resultado) no pueden perderse ni desordenarse. En la practica, ambos protocolos entregaron correctamente los mensajes en entorno loopback: el suscriptor 1 recibio 12 mensajes y el suscriptor 2 recibio 24 mensajes en ambas versiones. Sin embargo, TCP garantiza esto a nivel de protocolo con ACKs y retransmision automatica, mientras que UDP no ofrece ninguna garantia: en una red real con congestion o perdida de paquetes, UDP podria perder mensajes sin que el emisor lo detecte.
+
+Para actualizaciones de alta frecuencia y menor criticidad (por ejemplo, estadisticas en tiempo real como posesion del balon o posicion de jugadores), UDP seria preferible por su menor latencia y overhead. En la captura se observo que UDP uso solo 5,814 bytes frente a los 12,342 de TCP para la misma cantidad de mensajes de negocio.
+
+La solucion optima en produccion seria hibrida: TCP para eventos criticos y UDP para actualizaciones frecuentes. De hecho, la solucion optima observada en la practica fue nuestra implementacion QUIC hibrida, que combina la baja latencia de UDP (sin handshake) con la confiabilidad de TCP (ACKs y retransmision), logrando solo 74 paquetes y 5,046 bytes frente a los 150 paquetes y 12,342 bytes de TCP, para la misma carga de mensajes.
+
+
+4. Compare el overhead observado en las capturas Wireshark entre TCP y UDP. Cual protocolo introduce mas cabeceras por mensaje? Como influye esto en la eficiencia?
+
+La cabecera TCP promedio observada fue de ~32 bytes (20 bytes fijos mas opciones como timestamps) mas 20 bytes de cabecera IP, sumando al menos 52 bytes de overhead por paquete. UDP tiene solo 8 bytes fijos de cabecera (puerto origen, puerto destino, longitud y checksum) mas 20 bytes de cabecera IP, totalizando 28 bytes por paquete. Esto representa una diferencia de 24 bytes por cada paquete transmitido.
+
+Ademas, TCP genera paquetes pure-ACK (de 56 a 68 bytes sin datos de aplicacion) por cada segmento recibido, y el three-way handshake inicial agrega 3 paquetes de control por conexion. Esto explica por que la captura TCP sumo 12,342 bytes frente a los 5,814 de UDP para sesiones con la misma cantidad de mensajes de negocio. Los paquetes pure-ACK de TCP representan trafico de control puro que UDP elimina completamente, haciendolo mas eficiente en ancho de banda para mensajes cortos y frecuentes como los eventos deportivos.
+
+En nuestra implementacion QUIC, los ACKs de aplicacion son paquetes UDP de solo ~5 bytes de payload ("ACK|N"), mucho mas ligeros que un paquete pure-ACK de TCP (56-68 bytes), lo que permite obtener confiabilidad con un overhead significativamente menor.
+
+
+5. Si el marcador de un partido llega desordenado en UDP (por ejemplo, primero se recibe el 2-1 y luego el 1-1), que efectos tendria en la experiencia del usuario? Como podria solucionarse este problema a nivel de aplicacion?
+
+Si el suscriptor recibe el marcador 2-1 antes que el 1-1, la experiencia seria confusa: el usuario veria al equipo ganar 2-1 y luego recibiria que el marcador es 1-1, contradiciendo la informacion anterior. Sin contexto temporal, el usuario no sabria cual es el estado real del partido. En un escenario con muchos eventos rapidos (por ejemplo, dos goles en pocos minutos), este desorden podria hacer que la aplicacion sea inutilizable.
+
+A nivel de aplicacion, esto se soluciona agregando numeros de secuencia a cada mensaje, como implementamos en la version QUIC. El publicador asigna un numero secuencial incremental a cada evento (seq=1, seq=2, ...) y el suscriptor mantiene un contador del proximo seq esperado. Si llega un mensaje con un seq mayor al esperado, el suscriptor puede almacenarlo en un buffer y esperar a que lleguen los mensajes faltantes antes de mostrarlo. Si llega un seq menor o igual al ultimo mostrado, se descarta como duplicado. Esta funcionalidad la ofrece TCP de forma nativa y gratuita a nivel de protocolo, ya que reordena automaticamente los segmentos antes de entregarlos a la aplicacion.
+
+
+6. Como cambia el desempeno del sistema cuando aumenta el numero de suscriptores interesados en un mismo partido? Que diferencias se observaron entre TCP y UDP en este aspecto?
+
+Con TCP, cada nuevo suscriptor agrega un file descriptor al conjunto monitoreado por select(), cuya revision tiene complejidad O(n) por ciclo. Al publicar un mensaje, el broker itera todos los suscriptores del tema y ejecuta send() secuencialmente para cada uno. Si algun buffer de envio esta lleno, send() podria bloquearse, introduciendo latencia para los suscriptores restantes. En nuestra ejecucion con 2 suscriptores el efecto fue imperceptible, pero con 1,000 suscriptores la latencia acumulada seria significativa.
+
+UDP escala mejor en este aspecto: el broker usa un unico socket y ejecuta sendto() para cada direccion registrada. No hay file descriptors adicionales ni estado de conexion por cliente. Ademas, UDP soporta la posibilidad de utilizar multicast, que permite enviar un unico datagrama a una direccion de grupo que todos los suscriptores reciben simultaneamente desde la infraestructura de red, eliminando completamente el bucle secuencial de envio. Sin embargo, en nuestra implementacion no utilizamos multicast, por lo que el broker tambien itera secuencialmente; la ventaja observada fue la ausencia de overhead por conexion.
+
+
+7. Que sucede si el broker se detiene inesperadamente? Que diferencias hay entre TCP y UDP en la capacidad de recuperacion de la sesion?
+
+En TCP, la caida del broker genera un RST o FIN que los clientes detectan en la proxima llamada a send() o recv() como un error (ECONNRESET o retorno 0). Esto permite implementar logica de reconexion automatica. El fallo se detecta de forma determinista y rapida, como se observo en la ejecucion TCP cuando los publicadores cerraron conexion y el broker lo detecto inmediatamente.
+
+En UDP, la caida del broker es invisible para los clientes: los publicadores siguen enviando datagramas que el kernel descarta silenciosamente ya que nadie los recibe, y los suscriptores quedan esperando indefinidamente en recvfrom() sin ninguna notificacion. Para detectar la caida seria necesario implementar un mecanismo de heartbeat a nivel de aplicacion (por ejemplo, enviar un paquete periodico de "ping" y si no se recibe respuesta en un tiempo, asumir que el broker cayo), lo que agrega complejidad equivalente a reimplementar parte de lo que TCP ya ofrece.
+
+En nuestra implementacion QUIC, el publisher detecta la caida del broker porque deja de recibir ACKs. Tras 3 reintentos sin respuesta (1.5 segundos en total), reporta "FALLO: sin ACK tras 3 intentos para seq=N". Esto ofrece una deteccion intermedia: mejor que UDP puro (que no detecta nada) pero sin la inmediatez de TCP, donde recv() retorna 0 instantaneamente al recibir el FIN.
+
+
+8. Como garantizar que todos los suscriptores reciban en el mismo instante las actualizaciones criticas (por ejemplo, un gol)? Que protocolo facilita mejor esta sincronizacion y por que?
+
+TCP no garantiza entrega exactamente simultanea: el broker envia mensajes secuencialmente con send(), por lo que el primer suscriptor siempre recibe el mensaje antes que el ultimo. En la captura se observo una diferencia de ~0.008 ms entre los envios a dos suscriptores (paquetes 21 y 22), que es despreciable para noticias deportivas pero podria ser relevante en otros contextos donde la sincronizacion estricta es critica.
+
+UDP con multicast facilita mejor la sincronizacion: un unico datagrama enviado a una direccion multicast lo reciben todos los suscriptores del grupo simultaneamente desde la infraestructura de red, sin que el broker necesite iterar ni enviar copias individuales. Sin embargo, multicast requiere soporte de la red y no lo implementamos en esta practica. Para TCP, la alternativa seria lanzar los send() en threads paralelos para reducir el desfase entre suscriptores, aunque esto agrega complejidad de programacion concurrente.
+
+Cabe aclarar que en nuestra implementacion actual, tanto en TCP como en UDP y QUIC, el broker envia los mensajes de forma secuencial en un bucle, por lo que en ninguno de los tres casos se logra simultaneidad perfecta.
+
+
+9. Analice el uso de CPU y memoria en el broker cuando maneja multiples conexiones TCP frente al manejo de datagramas UDP. Que diferencias encontro?
+
+El broker TCP mantiene estado por cada cliente en el kernel: un file descriptor, un buffer de recepcion de 1024 bytes, una ventana deslizante y timers de retransmision. En nuestro codigo, ademas se mantiene un buffer parcial por cliente (arreglo client_buf[MAX_CLIENTS][BUFFER_SIZE]) para manejar mensajes fragmentados. El uso de CPU crece con el numero de conexiones activas porque select() revisa cada fd en cada iteracion del bucle principal, incluso si no hay datos disponibles.
+
+El broker UDP no mantiene estado de conexion en el kernel; solo la tabla de suscriptores en espacio de usuario (arreglo de TopicEntry con las direcciones sockaddr_in de los suscriptores). El procesamiento por datagrama consiste en: recvfrom() para recibir, busqueda en la tabla de temas y sendto() para cada suscriptor. No hay calculo de ventana, no hay timers de retransmision ni buffers parciales por cliente. Esto resulta en un consumo de CPU y memoria notablemente menor bajo la misma carga.
+
+En la version QUIC, el broker tiene un perfil de recursos intermedio: usa un unico socket UDP (como el broker UDP) pero la funcion reliable_send() introduce una espera activa con select() y timeout por cada suscriptor al que envia un mensaje, lo que aumenta el tiempo de procesamiento por mensaje en comparacion con UDP puro.
+
+
+10. Si tuviera que disenar un sistema real de transmision de actualizaciones de partidos de futbol para millones de usuarios, elegiria TCP, UDP o una combinacion de ambos? Justifique con base en lo observado en el laboratorio.
+
+La solucion optima seria una combinacion por capas. Para la ingesta (Publisher hacia Broker), usaria TCP, donde los eventos criticos no pueden perderse y los clientes son pocos (los periodistas deportivos). Para la distribucion masiva (Broker hacia Suscriptores), usaria UDP/QUIC, donde la escalabilidad es prioritaria y se pueden tener millones de usuarios concurrentes.
+
+Este es exactamente el modelo de HTTP/3, que usa QUIC sobre UDP para combinar confiabilidad a nivel de aplicacion con la eficiencia de UDP. Nuestra implementacion del bono QUIC demostro que esto es viable: se logro confiabilidad completa (0 mensajes perdidos, 0 fuera de orden) con un overhead de solo +17.5% de paquetes respecto a UDP puro (74 vs 63) y menos bytes totales que TCP (5,046 vs 12,342).
+
+Ademas, para millones de usuarios se podria aprovechar UDP multicast para enviar un unico paquete a todos los suscriptores de un mismo grupo, eliminando la necesidad de que el broker envie copias individuales. Combinando esta tecnica con ACKs selectivos a nivel de aplicacion para eventos criticos (goles, resultado final), se lograria un sistema eficiente, escalable y confiable.
+
+========================================
+CONCLUSIONES
+========================================
+
+- TCP garantiza confiabilidad y orden, pero introduce un overhead significativo: de los 150 paquetes observados en la captura, el 58% fueron paquetes de control (ACKs, SYN, FIN), y el trafico total fue 2.12 veces mayor que UDP para la misma cantidad de mensajes de negocio. El three-way handshake agrega latencia inicial en cada conexion, y el control de flujo (observable en el campo Window Size de los paquetes capturados) permite al protocolo ajustar la tasa de envio segun la capacidad del receptor.
+
+- UDP maximiza la eficiencia con el 100% de los paquetes siendo datos utiles, pero no ofrece ninguna garantia de entrega, orden ni deteccion de fallos. Para una aplicacion de noticias deportivas donde perder un gol es inaceptable, UDP puro no es suficiente. Sin embargo, su menor overhead de cabeceras (28 bytes vs 52+ bytes por paquete) lo hace ideal como transporte base sobre el cual construir confiabilidad selectiva.
+
+- La implementacion QUIC hibrida demuestra que es posible obtener confiabilidad sobre UDP con overhead minimo: +17.5% de paquetes respecto a UDP puro y 59% menos bytes que TCP. Los ACKs a nivel de aplicacion, la retransmision con timeout y los numeros de secuencia proveen las mismas garantias funcionales que TCP, con la flexibilidad de poder aplicarlas selectivamente segun la criticidad de cada mensaje.
+
+- Para un sistema real de noticias deportivas, la mejor eleccion es un enfoque hibrido: usar UDP como transporte base e implementar confiabilidad selectiva a nivel de aplicacion, como hace QUIC (RFC 9000). Esto combina la baja latencia y escalabilidad de UDP con la fiabilidad de TCP, como se observo experimentalmente en los datos de las capturas.
+
+- Wireshark fue fundamental para verificar las diferencias a nivel de paquete entre los protocolos: el three-way handshake de TCP (visible en los primeros 3 paquetes de cada conexion), los ACKs automaticos con sus numeros de secuencia, los valores de Window Size para control de flujo, la ausencia total de control en UDP (donde cada paquete es un datagrama independiente), y los ACKs explicitos de nuestra implementacion QUIC. Estas observaciones permitieron contrastar el comportamiento teorico de los protocolos con la evidencia real del trafico capturado.
