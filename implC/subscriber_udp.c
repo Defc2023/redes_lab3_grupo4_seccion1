@@ -26,6 +26,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #define BUFFER_SIZE 1024
 
@@ -46,6 +47,15 @@ int main(int argc, char *argv[]) {
         perror("socket");
         exit(EXIT_FAILURE);
     }
+
+    /* Configurar un buffer de recepcion limitado (8KB) para simular un
+     * receptor con recursos moderados, como ocurre en dispositivos moviles
+     * o sistemas embebidos. Cuando llegan mas datagramas de los que caben
+     * en el buffer, el sistema operativo los descarta silenciosamente.
+     * 8KB es suficiente para recibir algunos mensajes pero no todos
+     * cuando llegan en rafagas rapidas. */
+    int rcvbuf = 8192;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     /* Configurar la direccion del broker */
     struct sockaddr_in broker_addr;
@@ -81,7 +91,8 @@ int main(int argc, char *argv[]) {
 
     printf("\nEsperando actualizaciones en vivo...\n\n");
 
-    /* Bucle principal: recibir datagramas del broker */
+    /* Bucle principal: recibir datagramas del broker.
+     * El suscriptor permanece escuchando indefinidamente (Ctrl+C para salir). */
     char buffer[BUFFER_SIZE];
     int msg_count = 0;
 
@@ -102,6 +113,13 @@ int main(int argc, char *argv[]) {
         buffer[n] = '\0';
         msg_count++;
         printf("  #%d %s\n", msg_count, buffer);
+
+        /* Simular procesamiento del mensaje (20ms): en un sistema real,
+         * el suscriptor procesaria cada mensaje (actualizar UI, guardar
+         * en base de datos, etc.). Este procesamiento hace que el receptor
+         * sea mas lento que el emisor, lo que naturalmente causa que
+         * algunos datagramas se descarten cuando el buffer se llena. */
+        usleep(20000);
     }
 
     printf("[Sub] Total de mensajes recibidos: %d\n", msg_count);
