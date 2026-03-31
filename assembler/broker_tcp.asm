@@ -1,854 +1,689 @@
-; =============================================================================
-; broker_tcp.asm — Broker TCP para el sistema de noticias deportivas
-; =============================================================================
+; broker_tcp.asm
+; Broker TCP pub/sub para noticias deportivas
 ; Uso: ./broker_tcp <puerto>
 ;
-; Descripcion:
-;   Acepta conexiones TCP de publicadores y suscriptores.
-;   Usa select() para multiplexar todos los fds sin hilos.
-;   Protocolo entrante:
-;     SUBSCRIBE|tema\n   → registra el fd como suscriptor del tema
-;     PUBLISH|tema|msg\n → reenviar msg a todos los suscriptores del tema
+; Mantiene una tabla de temas con sus suscriptores (fds).
+; Usa select() para manejar multiples clientes sin threads.
+; Protocolo:
+;   SUBSCRIBE|tema\n  -> registra fd como suscriptor
+;   PUBLISH|tema|msg\n -> reenviar a todos los suscriptores del tema
 ;
-; Compilacion:
-;   nasm -f elf64 broker_tcp.asm -o broker_tcp.o
-;   gcc -no-pie broker_tcp.o -o broker_tcp
-; =============================================================================
+; nasm -f elf64 broker_tcp.asm -o broker_tcp.o
+; gcc -no-pie broker_tcp.o -o broker_tcp
 
 bits 64
 default rel
 
-; ---------------------------------------------------------------------------
-; Funciones de libc / POSIX
-; ---------------------------------------------------------------------------
-extern printf
-extern snprintf
-extern socket
-extern bind
-extern listen
-extern accept
-extern recv
-extern send
-extern close
-extern select
-extern setsockopt
-extern htons
-extern memset
-extern strlen
-extern strncpy
-extern strncmp
-extern atoi
+extern printf, snprintf, socket, bind, listen, accept
+extern recv, send, close, select, setsockopt
+extern htons, memset, strlen, strncpy, strncmp, atoi
 
-; ---------------------------------------------------------------------------
-; Constantes de sockets
-; ---------------------------------------------------------------------------
-AF_INET       equ 2
-SOCK_STREAM   equ 1
-SOL_SOCKET    equ 1
-SO_REUSEADDR  equ 2
-BACKLOG       equ 10
+AF_INET      equ 2
+SOCK_STREAM  equ 1
+SOL_SOCKET   equ 1
+SO_REUSEADDR equ 2
+BACKLOG      equ 10
 
-SOCKADDR_IN_SIZE equ 16
-BUF_SIZE         equ 1024
+BUF_SIZE equ 1024
 
-; ---------------------------------------------------------------------------
-; Estructura de la tabla de temas (TopicEntry):
-;   +0   nombre del tema   128 bytes  (cadena terminada en nulo)
-;   +128 array de fds      200 bytes  (50 enteros de 32 bits)
-;   +328 num_subs           4 bytes   (int32)
-;   +332 relleno            4 bytes
-;   Total: 336 bytes
-; ---------------------------------------------------------------------------
-TOPIC_NAME_LEN   equ 128
-MAX_SUBS_PER_TOPIC equ 50
-TOPIC_ENTRY_SIZE equ 336
-MAX_TOPICS       equ 20
-MAX_CLIENTS      equ 64   ; maximo de fds cliente simulados
+; layout de cada entrada en la tabla de temas:
+;   +0   nombre (128 bytes)
+;   +128 array de fds suscriptores (50 * 4 = 200 bytes)
+;   +328 cantidad de suscriptores (int32)
+;   +332 padding (4 bytes)
+;   total: 336 bytes
+TNAME_LEN  equ 128
+MAX_SUBS   equ 50
+T_ENTRY    equ 336
+MAX_TOPICS equ 20
 
-; ---------------------------------------------------------------------------
-; Datos de solo lectura
-; ---------------------------------------------------------------------------
 section .data
 
-usage_msg    db  "Uso: ./broker_tcp <puerto>", 10, 0
-err_socket   db  "Error: socket()", 10, 0
-err_bind     db  "Error: bind()", 10, 0
-err_listen   db  "Error: listen()", 10, 0
-err_accept   db  "Error: accept()", 10, 0
+uso      db "Uso: ./broker_tcp <puerto>", 10, 0
+e_sock   db "Error: socket()", 10, 0
+e_bind   db "Error: bind()", 10, 0
+e_listen db "Error: listen()", 10, 0
 
-msg_start    db  "Broker TCP escuchando en puerto %d...", 10, 0
-msg_client   db  "[Broker] Nueva conexion: fd=%d", 10, 0
-msg_closed   db  "[Broker] Conexion cerrada: fd=%d", 10, 0
-msg_sub      db  "[Broker] SUBSCRIBE fd=%d tema='%s'", 10, 0
-msg_pub      db  "[Broker] PUBLISH tema='%s' msg='%s'", 10, 0
-msg_fwd      db  "[Broker] Reenviando a fd=%d", 10, 0
-msg_unknown  db  "[Broker] Mensaje desconocido de fd=%d", 10, 0
+msg_ini  db "Broker TCP escuchando en puerto %d...", 10, 0
+msg_new  db "[Broker] Nueva conexion: fd=%d", 10, 0
+msg_bye  db "[Broker] Conexion cerrada: fd=%d", 10, 0
+msg_sub  db "[Broker] SUBSCRIBE fd=%d tema='%s'", 10, 0
+msg_pub  db "[Broker] PUBLISH tema='%s' msg='%s'", 10, 0
+msg_fwd  db "[Broker] Reenviando a fd=%d", 10, 0
+msg_unk  db "[Broker] Mensaje desconocido de fd=%d", 10, 0
 
-; Separadores de protocolo
-sep_pipe     db  "|", 0
-sep_nl       db  10, 0
+fmt_fwd  db "[%s] %s", 10, 0   ; lo que recibe el suscriptor
 
-; Prefijo para mensaje reenviado al suscriptor: "[tema] mensaje\n"
-fmt_forward  db  "[%s] %s", 10, 0
+opt_one  dd 1
 
-opt_one      dd  1          ; valor para setsockopt SO_REUSEADDR
-
-; ---------------------------------------------------------------------------
-; Datos no inicializados
-; ---------------------------------------------------------------------------
 section .bss
 
-listen_fd    resd 1                         ; fd del socket de escucha
-port_num     resd 1                         ; numero de puerto
+lfd       resd 1        ; fd del socket que escucha
+svaddr    resb 16
+claddr    resb 16
+cllen     resd 1
 
-server_addr  resb SOCKADDR_IN_SIZE          ; sockaddr_in del servidor
-client_addr  resb SOCKADDR_IN_SIZE          ; sockaddr_in del cliente (accept)
-client_len   resd 1                         ; longitud de client_addr
+; fd_set en Linux = 128 bytes (un bit por fd, hasta 1024 fds)
+mset      resb 128      ; master set
+rset      resb 128      ; copia para cada llamada a select
 
-; fd_set para select() (128 bytes en Linux 64-bit)
-master_set   resb 128
-read_set     resb 128
+maxfd     resd 1
 
-max_fd       resd 1                         ; fd maximo conocido
+rbuf      resb BUF_SIZE
+fwdbuf    resb BUF_SIZE
 
-recv_buf     resb BUF_SIZE                  ; buffer de recepcion
-fwd_buf      resb BUF_SIZE                  ; buffer para mensaje reenviado
+; tabla de temas
+ttable    resb MAX_TOPICS * T_ENTRY
+ntopics   resd 1
 
-; Tabla de temas: MAX_TOPICS entradas de TOPIC_ENTRY_SIZE cada una
-topic_table  resb MAX_TOPICS * TOPIC_ENTRY_SIZE
-
-num_topics   resd 1                         ; numero de temas activos
-
-; ---------------------------------------------------------------------------
-; Codigo
-; ---------------------------------------------------------------------------
 section .text
 global main
 
-; ============================================================
-; main(int argc, char **argv)
-; ============================================================
 main:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    ; 6 pushes → rsp ≡ 8+6*8 = 56 ≡ 8 (mod 16). Necesitamos sub rsp,8.
-    sub     rsp, 8
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
 
-    ; ---- Verificar argumentos ----
-    cmp     rdi, 2
-    jge     .args_ok
-    lea     rdi, [rel usage_msg]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+    cmp rdi, 2
+    jge .ok
+    lea rdi, [rel uso]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
-.args_ok:
-    mov     rbx, rsi            ; rbx = argv
-    mov     rdi, [rbx + 8]      ; argv[1] = cadena de puerto
-    xor     eax, eax
-    call    atoi
-    mov     [rel port_num], eax
-    mov     r12d, eax           ; r12d = puerto
+.ok:
+    mov rbx, rsi
+    mov rdi, [rbx+8]
+    xor eax, eax
+    call atoi
+    mov r12d, eax   ; puerto
 
-    ; ---- Inicializar tabla de temas a cero ----
-    lea     rdi, [rel topic_table]
-    xor     esi, esi
-    mov     edx, MAX_TOPICS * TOPIC_ENTRY_SIZE
-    call    memset
+    ; limpiar tabla de temas
+    lea rdi, [rel ttable]
+    xor esi, esi
+    mov edx, MAX_TOPICS * T_ENTRY
+    call memset
 
-    ; -------------------------------------------------------
-    ; 1. Crear socket TCP de escucha
-    ; -------------------------------------------------------
-    mov     edi, AF_INET
-    mov     esi, SOCK_STREAM
-    xor     edx, edx
-    call    socket
-    cmp     eax, -1
-    je      .err_socket
-    mov     [rel listen_fd], eax
-    movsxd  r13, eax            ; r13 = listen_fd
+    ; crear socket
+    mov edi, AF_INET
+    mov esi, SOCK_STREAM
+    xor edx, edx
+    call socket
+    cmp eax, -1
+    je .err_sock
+    mov [rel lfd], eax
+    movsxd r13, eax
 
-    ; Opcion SO_REUSEADDR para reutilizar el puerto rapidamente
-    mov     rdi, r13
-    mov     esi, SOL_SOCKET
-    mov     edx, SO_REUSEADDR
-    lea     rcx, [rel opt_one]
-    mov     r8d, 4
-    call    setsockopt
+    ; SO_REUSEADDR para no esperar TIME_WAIT al reiniciar
+    mov rdi, r13
+    mov esi, SOL_SOCKET
+    mov edx, SO_REUSEADDR
+    lea rcx, [rel opt_one]
+    mov r8d, 4
+    call setsockopt
 
-    ; -------------------------------------------------------
-    ; 2. Construir sockaddr_in y hacer bind
-    ; -------------------------------------------------------
-    lea     rdi, [rel server_addr]
-    xor     esi, esi
-    mov     edx, SOCKADDR_IN_SIZE
-    call    memset
+    ; bind
+    lea rdi, [rel svaddr]
+    xor esi, esi
+    mov edx, 16
+    call memset
 
-    mov     word [rel server_addr], AF_INET
+    mov word [rel svaddr], AF_INET
+    mov edi, r12d
+    call htons
+    mov word [rel svaddr+2], ax
 
-    mov     edi, r12d
-    call    htons
-    mov     word [rel server_addr + 2], ax
+    mov rdi, r13
+    lea rsi, [rel svaddr]
+    mov edx, 16
+    call bind
+    cmp eax, -1
+    je .err_bind
 
-    ; INADDR_ANY = 0 (ya esta en cero tras memset)
+    mov rdi, r13
+    mov esi, BACKLOG
+    call listen
+    cmp eax, -1
+    je .err_listen
 
-    mov     rdi, r13
-    lea     rsi, [rel server_addr]
-    mov     edx, SOCKADDR_IN_SIZE
-    call    bind
-    cmp     eax, -1
-    je      .err_bind
+    lea rdi, [rel msg_ini]
+    mov esi, r12d
+    xor eax, eax
+    call printf
 
-    ; -------------------------------------------------------
-    ; 3. Escuchar conexiones entrantes
-    ; -------------------------------------------------------
-    mov     rdi, r13
-    mov     esi, BACKLOG
-    call    listen
-    cmp     eax, -1
-    je      .err_listen
+    ; inicializar fd_set con el fd de escucha
+    lea rdi, [rel mset]
+    xor esi, esi
+    mov edx, 128
+    call memset
 
-    ; Anunciar que el broker esta listo
-    lea     rdi, [rel msg_start]
-    mov     esi, r12d
-    xor     eax, eax
-    call    printf
+    lea rsi, [rel mset]
+    mov edi, r13d
+    call .fdset_set
 
-    ; -------------------------------------------------------
-    ; 4. Inicializar fd_set maestro con el fd de escucha
-    ; -------------------------------------------------------
-    ; Poner master_set a cero
-    lea     rdi, [rel master_set]
-    xor     esi, esi
-    mov     edx, 128
-    call    memset
+    mov [rel maxfd], r13d
 
-    ; FD_SET(listen_fd, &master_set)
-    lea     rsi, [rel master_set]
-    mov     edi, r13d
-    call    fdset_set
+; bucle principal: select -> revisar fds activos
+.sel:
+    ; copiar mset a rset
+    lea rdi, [rel rset]
+    lea rsi, [rel mset]
+    mov ecx, 16
+    rep movsq
 
-    mov     [rel max_fd], r13d  ; max_fd = listen_fd
+    mov eax, [rel maxfd]
+    inc eax
+    movsxd rdi, eax
+    lea rsi, [rel rset]
+    xor edx, edx
+    xor ecx, ecx
+    xor r8d, r8d
+    call select
+    cmp eax, -1
+    jl .sel
 
-    ; -------------------------------------------------------
-    ; 5. Bucle principal de select()
-    ; -------------------------------------------------------
-.select_loop:
-    ; Copiar master_set → read_set
-    lea     rdi, [rel read_set]
-    lea     rsi, [rel master_set]
-    mov     ecx, 16             ; 128 bytes / 8 = 16 qwords
-    rep     movsq
+    xor r14d, r14d   ; fd iterador
 
-    ; select(max_fd+1, &read_set, NULL, NULL, NULL)
-    mov     eax, [rel max_fd]
-    inc     eax
-    movsxd  rdi, eax
-    lea     rsi, [rel read_set]
-    xor     edx, edx
-    xor     ecx, ecx
-    xor     r8d, r8d
-    call    select
-    cmp     eax, -1
-    jl      .select_loop        ; error transitorio, reintentar
+.scan:
+    mov eax, [rel maxfd]
+    cmp r14d, eax
+    jg .sel
 
-    ; Recorrer todos los fds posibles (0..max_fd)
-    xor     r14d, r14d          ; r14d = fd iterador
+    lea rsi, [rel rset]
+    mov edi, r14d
+    call .fdset_isset
+    test eax, eax
+    jz .next
 
-.fd_scan_loop:
-    mov     eax, [rel max_fd]
-    cmp     r14d, eax
-    jg      .select_loop        ; fin del recorrido → volver a select
+    cmp r14d, r13d
+    je .new_conn
 
-    ; FD_ISSET(r14d, &read_set)?
-    lea     rsi, [rel read_set]
-    mov     edi, r14d
-    call    fdset_isset
-    test    eax, eax
-    jz      .next_fd
+    ; cliente existente -> leer
+    movsxd rdi, r14d
+    lea rsi, [rel rbuf]
+    mov edx, BUF_SIZE-1
+    xor ecx, ecx
+    call recv
+    cmp rax, 0
+    jle .desconectado
 
-    ; ¿Es el fd de escucha? → nueva conexion
-    cmp     r14d, r13d
-    je      .new_connection
+    lea rbx, [rel rbuf]
+    mov byte [rbx+rax], 0
 
-    ; ¿Es un cliente existente? → leer datos
-    mov     r15d, r14d          ; r15d = fd del cliente
-    jmp     .read_client
+    movsxd rdi, r14d
+    lea rsi, [rel rbuf]
+    call .procesar
+    jmp .next
 
-.next_fd:
-    inc     r14d
-    jmp     .fd_scan_loop
+.desconectado:
+    lea rdi, [rel msg_bye]
+    mov esi, r14d
+    xor eax, eax
+    call printf
 
-; --- Nueva conexion entrante ---
-.new_connection:
-    mov     dword [rel client_len], SOCKADDR_IN_SIZE
-    mov     rdi, r13
-    lea     rsi, [rel client_addr]
-    lea     rdx, [rel client_len]
-    call    accept
-    cmp     eax, -1
-    je      .next_fd
+    movsxd rdi, r14d
+    call .quitar_fd
 
-    movsxd  rbx, eax            ; rbx = nuevo fd cliente
+    lea rsi, [rel mset]
+    mov edi, r14d
+    call .fdset_clr
 
-    ; Anunciar nueva conexion
-    lea     rdi, [rel msg_client]
-    mov     esi, ebx
-    xor     eax, eax
-    call    printf
+    movsxd rdi, r14d
+    call close
+    jmp .next
 
-    ; FD_SET(nuevo_fd, &master_set)
-    lea     rsi, [rel master_set]
-    mov     edi, ebx
-    call    fdset_set
+.new_conn:
+    mov dword [rel cllen], 16
+    mov rdi, r13
+    lea rsi, [rel claddr]
+    lea rdx, [rel cllen]
+    call accept
+    cmp eax, -1
+    je .next
+    movsxd rbx, eax
 
-    ; Actualizar max_fd si es necesario
-    mov     eax, [rel max_fd]
-    cmp     ebx, eax
-    jle     .next_fd
-    mov     [rel max_fd], ebx
-    jmp     .next_fd
+    lea rdi, [rel msg_new]
+    mov esi, ebx
+    xor eax, eax
+    call printf
 
-; --- Leer datos de un cliente ---
-.read_client:
-    movsxd  rdi, r15d
-    lea     rsi, [rel recv_buf]
-    mov     edx, BUF_SIZE - 1
-    xor     ecx, ecx
-    call    recv
-    cmp     rax, 0
-    jle     .client_disconnected
+    lea rsi, [rel mset]
+    mov edi, ebx
+    call .fdset_set
 
-    ; Terminar la cadena en nulo
-    lea     rbx, [rel recv_buf]
-    mov     byte [rbx + rax], 0
+    mov eax, [rel maxfd]
+    cmp ebx, eax
+    jle .next
+    mov [rel maxfd], ebx
 
-    ; Procesar el mensaje recibido
-    movsxd  rdi, r15d           ; fd del cliente
-    lea     rsi, [rel recv_buf] ; puntero al mensaje
-    call    process_message
-    jmp     .next_fd
+.next:
+    inc r14d
+    jmp .scan
 
-; --- Cliente desconectado ---
-.client_disconnected:
-    ; Anunciar desconexion
-    lea     rdi, [rel msg_closed]
-    mov     esi, r15d
-    xor     eax, eax
-    call    printf
-
-    ; Eliminar fd de todos los temas
-    movsxd  rdi, r15d
-    call    remove_fd_from_topics
-
-    ; FD_CLR(fd, &master_set)
-    lea     rsi, [rel master_set]
-    mov     edi, r15d
-    call    fdset_clr
-
-    ; Cerrar socket
-    movsxd  rdi, r15d
-    call    close
-    jmp     .next_fd
-
-; --- Manejadores de error ---
-.err_socket:
-    lea     rdi, [rel err_socket]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+.err_sock:
+    lea rdi, [rel e_sock]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
 .err_bind:
-    lea     rdi, [rel err_bind]
-    xor     eax, eax
-    call    printf
-    mov     rdi, r13
-    call    close
-    mov     eax, 1
-    jmp     .exit
+    lea rdi, [rel e_bind]
+    xor eax, eax
+    call printf
+    mov rdi, r13
+    call close
+    mov eax, 1
+    jmp .fin
 
 .err_listen:
-    lea     rdi, [rel err_listen]
-    xor     eax, eax
-    call    printf
-    mov     rdi, r13
-    call    close
-    mov     eax, 1
+    lea rdi, [rel e_listen]
+    xor eax, eax
+    call printf
+    mov rdi, r13
+    call close
+    mov eax, 1
 
-.exit:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.fin:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
-; =============================================================================
-; process_message(rdi=fd, rsi=msg_ptr)
-;   Analiza el mensaje y despacha a subscribe_fd o publish_msg.
-;   Formato SUBSCRIBE: "SUBSCRIBE|tema\n"
-;   Formato PUBLISH:   "PUBLISH|tema|mensaje\n"
-; =============================================================================
-process_message:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 8
+; procesar(rdi=fd, rsi=msg)
+; parsea SUBSCRIBE o PUBLISH y actua
+.procesar:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
-    mov     r12d, edi           ; r12d = fd del cliente
-    mov     r13, rsi            ; r13 = puntero al mensaje
+    mov r12d, edi
+    mov r13, rsi
 
-    ; ¿Comienza con "SUBSCRIBE|"?
-    lea     rdi, [rel r13]
-    mov     rdi, r13
-    lea     rsi, [rel .str_subscribe]
-    mov     edx, 10             ; longitud de "SUBSCRIBE|"
-    call    strncmp
-    test    eax, eax
-    jnz     .check_publish
+    ; SUBSCRIBE|tema ?
+    mov rdi, r13
+    lea rsi, [rel .str_sub]
+    mov edx, 10
+    call strncmp
+    test eax, eax
+    jnz .check_pub
 
-    ; Extraer tema: puntero justo despues de "SUBSCRIBE|"
-    mov     r14, r13
-    add     r14, 10             ; r14 = inicio del tema
+    mov r14, r13
+    add r14, 10   ; apuntar al tema
 
-    ; Eliminar el \n final si existe
-    mov     rdi, r14
-    call    strlen
-    test    rax, rax
-    jz      .pm_done
-    lea     rbx, [r14 + rax - 1]
-    cmp     byte [rbx], 10
-    jne     .do_subscribe
-    mov     byte [rbx], 0      ; reemplazar \n por nulo
+    ; quitar \n si tiene
+    mov rdi, r14
+    call strlen
+    test rax, rax
+    jz .hacer_sub
+    lea rbx, [r14+rax-1]
+    cmp byte [rbx], 10
+    jne .hacer_sub
+    mov byte [rbx], 0
 
-.do_subscribe:
-    ; Imprimir log
-    lea     rdi, [rel msg_sub]
-    mov     esi, r12d
-    mov     rdx, r14
-    xor     eax, eax
-    call    printf
+.hacer_sub:
+    lea rdi, [rel msg_sub]
+    mov esi, r12d
+    mov rdx, r14
+    xor eax, eax
+    call printf
 
-    ; Registrar suscripcion
-    movsxd  rdi, r12d
-    mov     rsi, r14
-    call    subscribe_fd
-    jmp     .pm_done
+    movsxd rdi, r12d
+    mov rsi, r14
+    call .suscribir
+    jmp .proc_fin
 
-.check_publish:
-    ; ¿Comienza con "PUBLISH|"?
-    mov     rdi, r13
-    lea     rsi, [rel .str_publish]
-    mov     edx, 8              ; longitud de "PUBLISH|"
-    call    strncmp
-    test    eax, eax
-    jnz     .pm_unknown
+.check_pub:
+    ; PUBLISH|tema|mensaje ?
+    mov rdi, r13
+    lea rsi, [rel .str_pub]
+    mov edx, 8
+    call strncmp
+    test eax, eax
+    jnz .desconocido
 
-    ; Extraer tema: puntero justo despues de "PUBLISH|"
-    mov     r14, r13
-    add     r14, 8              ; r14 = inicio del tema
+    mov r14, r13
+    add r14, 8   ; tema empieza aqui
 
-    ; Encontrar el segundo '|' para separar tema de mensaje
-    mov     rdi, r14
-    xor     esi, esi
-    call    strlen
-    ; buscar '|' en r14
-    mov     rcx, rax
-    mov     rbx, r14
-.find_pipe:
-    test    rcx, rcx
-    jz      .pm_unknown
-    cmp     byte [rbx], '|'
-    je      .pipe_found
-    inc     rbx
-    dec     rcx
-    jmp     .find_pipe
+    ; buscar el | que separa tema de mensaje
+    mov rbx, r14
+.buscar_pipe:
+    cmp byte [rbx], 0
+    je .desconocido
+    cmp byte [rbx], '|'
+    je .pipe_ok
+    inc rbx
+    jmp .buscar_pipe
 
-.pipe_found:
-    mov     byte [rbx], 0      ; terminar tema en nulo
-    inc     rbx                ; rbx = inicio del mensaje
+.pipe_ok:
+    mov byte [rbx], 0
+    inc rbx   ; rbx = inicio del mensaje
 
-    ; Eliminar \n final del mensaje
-    mov     rdi, rbx
-    call    strlen
-    test    rax, rax
-    jz      .do_publish
-    lea     r15, [rbx + rax - 1]
-    cmp     byte [r15], 10
-    jne     .do_publish
-    mov     byte [r15], 0
+    ; quitar \n del mensaje
+    mov rdi, rbx
+    call strlen
+    test rax, rax
+    jz .hacer_pub
+    lea r15, [rbx+rax-1]
+    cmp byte [r15], 10
+    jne .hacer_pub
+    mov byte [r15], 0
 
-.do_publish:
-    ; Imprimir log
-    lea     rdi, [rel msg_pub]
-    mov     rsi, r14
-    mov     rdx, rbx
-    xor     eax, eax
-    call    printf
+.hacer_pub:
+    lea rdi, [rel msg_pub]
+    mov rsi, r14
+    mov rdx, rbx
+    xor eax, eax
+    call printf
 
-    ; Publicar el mensaje a los suscriptores
-    mov     rdi, r14            ; puntero al tema
-    mov     rsi, rbx            ; puntero al mensaje
-    call    publish_msg
-    jmp     .pm_done
+    mov rdi, r14
+    mov rsi, rbx
+    call .publicar
+    jmp .proc_fin
 
-.pm_unknown:
-    lea     rdi, [rel msg_unknown]
-    mov     esi, r12d
-    xor     eax, eax
-    call    printf
+.desconocido:
+    lea rdi, [rel msg_unk]
+    mov esi, r12d
+    xor eax, eax
+    call printf
 
-.pm_done:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.proc_fin:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
-.str_subscribe: db "SUBSCRIBE|", 0
-.str_publish:   db "PUBLISH|", 0
+.str_sub: db "SUBSCRIBE|", 0
+.str_pub: db "PUBLISH|", 0
 
-; =============================================================================
-; find_or_create_topic(rdi=topic_ptr) → rax = indice (0..MAX_TOPICS-1) o -1
-;   Busca el tema en topic_table; si no existe lo crea.
-; =============================================================================
-find_or_create_topic:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 8
+; buscar_o_crear_tema(rdi=nombre) -> rax=indice o -1
+.buscar_tema:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
-    mov     r12, rdi            ; r12 = puntero al tema buscado
-    xor     r13d, r13d          ; r13d = indice iterador
-    mov     r14d, -1            ; r14d = primer slot libre (-1 = ninguno)
+    mov r12, rdi
+    xor r13d, r13d
+    mov r14d, -1
 
-.foct_loop:
-    mov     eax, [rel num_topics]
-    cmp     r13d, MAX_TOPICS
-    jge     .foct_no_space
+.bt_loop:
+    cmp r13d, MAX_TOPICS
+    jge .bt_crear
 
-    ; Calcular puntero a entry[r13]
-    lea     rbx, [rel topic_table]
-    imul    rax, r13, TOPIC_ENTRY_SIZE
-    add     rbx, rax            ; rbx = &topic_table[r13]
+    lea rbx, [rel ttable]
+    imul rax, r13, T_ENTRY
+    add rbx, rax
 
-    ; ¿Slot vacio? (primer byte del nombre == 0)
-    cmp     byte [rbx], 0
-    jne     .foct_check_name
+    cmp byte [rbx], 0
+    jne .bt_cmp
 
-    ; Guardar primer slot libre
-    cmp     r14d, -1
-    jne     .foct_next
-    mov     r14d, r13d
-    jmp     .foct_next
+    cmp r14d, -1
+    jne .bt_sig
+    mov r14d, r13d
+    jmp .bt_sig
 
-.foct_check_name:
-    ; Comparar nombre del tema
-    mov     rdi, rbx
-    mov     rsi, r12
-    mov     edx, TOPIC_NAME_LEN
-    call    strncmp
-    test    eax, eax
-    jnz     .foct_next
+.bt_cmp:
+    mov rdi, rbx
+    mov rsi, r12
+    mov edx, TNAME_LEN
+    call strncmp
+    test eax, eax
+    jnz .bt_sig
+    mov eax, r13d
+    jmp .bt_ret
 
-    ; Encontrado: retornar indice
-    mov     eax, r13d
-    jmp     .foct_ret
+.bt_sig:
+    inc r13d
+    jmp .bt_loop
 
-.foct_next:
-    inc     r13d
-    jmp     .foct_loop
+.bt_crear:
+    cmp r14d, -1
+    je .bt_fallo
 
-.foct_no_space:
-    ; No se encontro; crear en el primer slot libre
-    cmp     r14d, -1
-    je      .foct_fail
+    lea rbx, [rel ttable]
+    imul rax, r14, T_ENTRY
+    add rbx, rax
 
-    ; Copiar nombre del tema al slot libre
-    lea     rbx, [rel topic_table]
-    imul    rax, r14, TOPIC_ENTRY_SIZE
-    add     rbx, rax            ; rbx = &topic_table[r14d]
+    mov rdi, rbx
+    mov rsi, r12
+    mov edx, TNAME_LEN-1
+    call strncpy
+    mov byte [rbx+TNAME_LEN-1], 0
+    mov dword [rbx+328], 0
 
-    mov     rdi, rbx
-    mov     rsi, r12
-    mov     edx, TOPIC_NAME_LEN - 1
-    call    strncpy
-    mov     byte [rbx + TOPIC_NAME_LEN - 1], 0
+    mov eax, [rel ntopics]
+    inc eax
+    mov [rel ntopics], eax
 
-    ; Inicializar num_subs a 0
-    mov     dword [rbx + 328], 0
+    mov eax, r14d
+    jmp .bt_ret
 
-    ; Incrementar contador de temas activos
-    mov     eax, [rel num_topics]
-    inc     eax
-    mov     [rel num_topics], eax
+.bt_fallo:
+    mov eax, -1
 
-    mov     eax, r14d
-    jmp     .foct_ret
-
-.foct_fail:
-    mov     eax, -1
-
-.foct_ret:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
+.bt_ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-; =============================================================================
-; subscribe_fd(rdi=fd, rsi=topic_ptr)
-;   Registra fd como suscriptor del tema dado.
-; =============================================================================
-subscribe_fd:
-    push    rbx
-    push    r12
-    push    r13
-    sub     rsp, 8
+; suscribir(rdi=fd, rsi=tema)
+.suscribir:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
 
-    movsxd  r12, edi            ; r12 = fd
-    mov     r13, rsi            ; r13 = puntero al tema
+    movsxd r12, edi
+    mov r13, rsi
 
-    ; Encontrar o crear el tema
-    mov     rdi, r13
-    call    find_or_create_topic
-    cmp     eax, -1
-    je      .sfd_done
+    mov rdi, r13
+    call .buscar_tema
+    cmp eax, -1
+    je .sub_fin
 
-    movsxd  rbx, eax            ; rbx = indice del tema
+    movsxd rbx, eax
+    lea rdi, [rel ttable]
+    imul rax, rbx, T_ENTRY
+    add rdi, rax
 
-    ; Calcular puntero a la entrada del tema
-    lea     rdi, [rel topic_table]
-    imul    rax, rbx, TOPIC_ENTRY_SIZE
-    add     rdi, rax            ; rdi = &topic_table[idx]
+    mov ecx, [rdi+328]
+    cmp ecx, MAX_SUBS
+    jge .sub_fin
 
-    ; Obtener num_subs actual
-    mov     ecx, [rdi + 328]
-    cmp     ecx, MAX_SUBS_PER_TOPIC
-    jge     .sfd_done
+    ; verificar que no este ya suscrito
+    xor r8d, r8d
+.sub_dup:
+    cmp r8d, ecx
+    jge .sub_add
+    mov eax, [rdi+128+r8*4]
+    cmp eax, r12d
+    je .sub_fin
+    inc r8d
+    jmp .sub_dup
 
-    ; Evitar duplicados: recorrer array de fds
-    xor     r8d, r8d
-.check_dup:
-    cmp     r8d, ecx
-    jge     .add_sub
-    mov     eax, [rdi + 128 + r8 * 4]
-    cmp     eax, r12d
-    je      .sfd_done           ; ya suscrito
-    inc     r8d
-    jmp     .check_dup
+.sub_add:
+    movsxd r8, ecx
+    mov [rdi+128+r8*4], r12d
+    inc ecx
+    mov [rdi+328], ecx
 
-.add_sub:
-    ; Agregar fd al array
-    movsxd  r8, ecx
-    mov     [rdi + 128 + r8 * 4], r12d
-    inc     ecx
-    mov     [rdi + 328], ecx
-
-.sfd_done:
-    add     rsp, 8
-    pop     r13
-    pop     r12
-    pop     rbx
+.sub_fin:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-; =============================================================================
-; publish_msg(rdi=topic_ptr, rsi=msg_ptr)
-;   Reenviar "[tema] mensaje\n" a todos los suscriptores del tema.
-; =============================================================================
-publish_msg:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 8
+; publicar(rdi=tema, rsi=msg)
+.publicar:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
-    mov     r12, rdi            ; r12 = puntero al tema
-    mov     r13, rsi            ; r13 = puntero al mensaje
+    mov r12, rdi
+    mov r13, rsi
 
-    ; Buscar tema (no crear si no existe)
-    mov     rdi, r12
-    call    find_or_create_topic
-    cmp     eax, -1
-    je      .pm2_done
+    mov rdi, r12
+    call .buscar_tema
+    cmp eax, -1
+    je .pub_fin
 
-    movsxd  rbx, eax
+    movsxd rbx, eax
+    lea r14, [rel ttable]
+    imul rax, rbx, T_ENTRY
+    add r14, rax
 
-    ; Calcular puntero a la entrada del tema
-    lea     r14, [rel topic_table]
-    imul    rax, rbx, TOPIC_ENTRY_SIZE
-    add     r14, rax            ; r14 = &topic_table[idx]
+    ; armar "[tema] mensaje\n" en fwdbuf
+    lea rdi, [rel fwdbuf]
+    mov esi, BUF_SIZE
+    lea rdx, [rel fmt_fwd]
+    mov rcx, r12
+    mov r8, r13
+    xor eax, eax
+    call snprintf
+    movsxd rbp, eax
 
-    ; Construir mensaje reenviado en fwd_buf: "[tema] mensaje\n"
-    lea     rdi, [rel fwd_buf]
-    mov     esi, BUF_SIZE
-    lea     rdx, [rel fmt_forward]
-    mov     rcx, r12            ; tema
-    mov     r8, r13             ; mensaje
-    xor     eax, eax
-    call    snprintf
-    movsxd  r15, eax            ; r15 = longitud del mensaje reenviado
+    mov ecx, [r14+328]
+    xor r13d, r13d
 
-    ; Recorrer array de suscriptores y enviar a cada uno
-    mov     ecx, [r14 + 328]    ; num_subs
-    xor     r13d, r13d          ; r13d = iterador
+.pub_loop:
+    cmp r13d, ecx
+    jge .pub_fin
 
-.fwd_loop:
-    cmp     r13d, ecx
-    jge     .pm2_done
+    movsxd rdi, dword [r14+128+r13*4]
 
-    movsxd  rdi, dword [r14 + 128 + r13 * 4]   ; fd del suscriptor
+    push rdi
+    push rcx
+    lea rdi, [rel msg_fwd]
+    mov esi, dword [r14+128+r13*4]
+    xor eax, eax
+    call printf
+    pop rcx
+    pop rdi
 
-    ; Imprimir log
-    push    rdi
-    push    rcx
-    lea     rdi, [rel msg_fwd]
-    mov     esi, dword [r14 + 128 + r13 * 4]
-    xor     eax, eax
-    call    printf
-    pop     rcx
-    pop     rdi
+    lea rsi, [rel fwdbuf]
+    mov rdx, rbp
+    xor ecx, ecx
+    call send
 
-    lea     rsi, [rel fwd_buf]
-    mov     rdx, r15
-    xor     ecx, ecx
-    call    send
+    inc r13d
+    mov ecx, [r14+328]
+    jmp .pub_loop
 
-    inc     r13d
-    mov     ecx, [r14 + 328]    ; recargar num_subs (podria cambiar)
-    jmp     .fwd_loop
-
-.pm2_done:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.pub_fin:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
-; =============================================================================
-; remove_fd_from_topics(rdi=fd)
-;   Eliminar fd del array de suscriptores en todos los temas.
-; =============================================================================
-remove_fd_from_topics:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    sub     rsp, 8
+; quitar_fd(rdi=fd) - sacar el fd de todos los temas
+.quitar_fd:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
 
-    movsxd  r12, edi            ; r12 = fd a eliminar
-    xor     r13d, r13d          ; r13d = indice de tema
+    movsxd r12, edi
+    xor r13d, r13d
 
-.rft_topic_loop:
-    cmp     r13d, MAX_TOPICS
-    jge     .rft_done
+.qfd_loop:
+    cmp r13d, MAX_TOPICS
+    jge .qfd_fin
 
-    ; Calcular puntero a la entrada del tema
-    lea     rbx, [rel topic_table]
-    imul    rax, r13, TOPIC_ENTRY_SIZE
-    add     rbx, rax
+    lea rbx, [rel ttable]
+    imul rax, r13, T_ENTRY
+    add rbx, rax
 
-    ; ¿Tema vacio? → saltar
-    cmp     byte [rbx], 0
-    je      .rft_next_topic
+    cmp byte [rbx], 0
+    je .qfd_next
 
-    ; Buscar fd en el array de suscriptores
-    mov     ecx, [rbx + 328]    ; num_subs
-    xor     r14d, r14d
+    mov ecx, [rbx+328]
+    xor r8d, r8d
+.qfd_scan:
+    cmp r8d, ecx
+    jge .qfd_next
+    mov eax, [rbx+128+r8*4]
+    cmp eax, r12d
+    je .qfd_remove
+    inc r8d
+    jmp .qfd_scan
 
-.rft_sub_loop:
-    cmp     r14d, ecx
-    jge     .rft_next_topic
-    mov     eax, [rbx + 128 + r14 * 4]
-    cmp     eax, r12d
-    je      .rft_remove
-    inc     r14d
-    jmp     .rft_sub_loop
+.qfd_remove:
+    dec ecx
+    mov eax, [rbx+128+rcx*4]
+    mov [rbx+128+r8*4], eax
+    mov [rbx+328], ecx
 
-.rft_remove:
-    ; Mover el ultimo fd a esta posicion y decrementar num_subs
-    dec     ecx
-    mov     eax, [rbx + 128 + rcx * 4]
-    mov     [rbx + 128 + r14 * 4], eax
-    mov     [rbx + 328], ecx
+.qfd_next:
+    inc r13d
+    jmp .qfd_loop
 
-.rft_next_topic:
-    inc     r13d
-    jmp     .rft_topic_loop
-
-.rft_done:
-    add     rsp, 8
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
+.qfd_fin:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-; =============================================================================
-; fdset_set(edi=fd, rsi=fdset_ptr)
-;   Implementacion de FD_SET en ensamblador.
-;   fd_set en Linux 64-bit = 128 bytes = array de 16 qwords de 64 bits.
-; =============================================================================
-fdset_set:
-    mov     eax, edi
-    mov     ecx, edi
-    shr     eax, 6              ; indice de palabra: fd / 64
-    and     ecx, 63             ; desplazamiento de bit: fd % 64
-    mov     rdx, 1
-    shl     rdx, cl             ; mascara = 1 << bit_offset
-    or      qword [rsi + rax*8], rdx
+; helpers para fd_set (operar bit a bit sobre los 128 bytes)
+; FD_SET(edi=fd, rsi=set)
+.fdset_set:
+    mov eax, edi
+    mov ecx, edi
+    shr eax, 6
+    and ecx, 63
+    mov rdx, 1
+    shl rdx, cl
+    or qword [rsi+rax*8], rdx
     ret
 
-; =============================================================================
-; fdset_clr(edi=fd, rsi=fdset_ptr)
-;   Implementacion de FD_CLR en ensamblador.
-; =============================================================================
-fdset_clr:
-    mov     eax, edi
-    mov     ecx, edi
-    shr     eax, 6
-    and     ecx, 63
-    mov     rdx, 1
-    shl     rdx, cl
-    not     rdx
-    and     qword [rsi + rax*8], rdx
+; FD_CLR(edi=fd, rsi=set)
+.fdset_clr:
+    mov eax, edi
+    mov ecx, edi
+    shr eax, 6
+    and ecx, 63
+    mov rdx, 1
+    shl rdx, cl
+    not rdx
+    and qword [rsi+rax*8], rdx
     ret
 
-; =============================================================================
-; fdset_isset(edi=fd, rsi=fdset_ptr) → rax (1=activo, 0=inactivo)
-;   Implementacion de FD_ISSET en ensamblador.
-; =============================================================================
-fdset_isset:
-    mov     eax, edi
-    mov     ecx, edi
-    shr     eax, 6
-    and     ecx, 63
-    mov     rdx, 1
-    shl     rdx, cl
-    test    qword [rsi + rax*8], rdx
-    setnz   al
-    movzx   rax, al
+; FD_ISSET(edi=fd, rsi=set) -> rax
+.fdset_isset:
+    mov eax, edi
+    mov ecx, edi
+    shr eax, 6
+    and ecx, 63
+    mov rdx, 1
+    shl rdx, cl
+    test qword [rsi+rax*8], rdx
+    setnz al
+    movzx rax, al
     ret

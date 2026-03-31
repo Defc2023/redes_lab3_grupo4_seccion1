@@ -1,591 +1,493 @@
-; =============================================================================
-; broker_udp.asm — Broker UDP para el sistema de noticias deportivas
-; =============================================================================
+; broker_udp.asm
+; Broker UDP - recibe SUBSCRIBE y PUBLISH, reenvía a suscriptores
 ; Uso: ./broker_udp <puerto>
 ;
-; Descripcion:
-;   Escucha en un puerto UDP. Procesa dos tipos de mensajes:
-;     SUBSCRIBE|tema   → guarda la direccion del remitente como suscriptor
-;     PUBLISH|tema|msg → reenviar msg a todos los suscriptores del tema
-;
-;   A diferencia del broker TCP, no hay conexiones persistentes.
-;   La identidad del suscriptor es su sockaddr_in (IP + puerto efimero).
-;
-; Compilacion:
-;   nasm -f elf64 broker_udp.asm -o broker_udp.o
-;   gcc -no-pie broker_udp.o -o broker_udp
-; =============================================================================
+; nasm -f elf64 broker_udp.asm -o broker_udp.o
+; gcc -no-pie broker_udp.o -o broker_udp
 
 bits 64
 default rel
 
-; ---------------------------------------------------------------------------
-; Funciones de libc / POSIX
-; ---------------------------------------------------------------------------
-extern printf
-extern snprintf
-extern socket
-extern bind
-extern recvfrom
-extern sendto
-extern close
-extern atoi
-extern htons
-extern memset
-extern memcmp
-extern strncmp
-extern strncpy
-extern strlen
+extern printf, snprintf, socket, bind, recvfrom, sendto, close, setsockopt
+extern atoi, htons, ntohs, inet_ntoa, memset, memcmp, strncmp, strncpy, strlen, strchr
 
-; ---------------------------------------------------------------------------
-; Constantes
-; ---------------------------------------------------------------------------
-AF_INET    equ 2
-SOCK_DGRAM equ 2
-INADDR_ANY equ 0
+AF_INET      equ 2
+SOCK_DGRAM   equ 2
+SOL_SOCKET   equ 1
+SO_REUSEADDR equ 2
+BUF_SIZE     equ 1024
 
-SOCKADDR_IN_SIZE equ 16
-BUF_SIZE         equ 1024
+; cada entrada de tema: 128 nombre + 50*16 subs + 4 num_subs + 4 pad = 936
+TOPIC_NAME   equ 128
+MAX_SUBS     equ 50
+ENTRY_SIZE   equ 936
+MAX_TOPICS   equ 50
 
-; ---------------------------------------------------------------------------
-; Estructura de la tabla de temas UDP (UdpTopicEntry):
-;   +0    nombre del tema     128 bytes
-;   +128  array de sockaddr_in de suscriptores  50 * 16 = 800 bytes
-;   +928  num_subs            4 bytes
-;   +932  relleno             4 bytes
-;   Total: 936 bytes
-; ---------------------------------------------------------------------------
-TOPIC_NAME_LEN     equ 128
-MAX_SUBS_PER_TOPIC equ 50
-UDP_TOPIC_ENTRY_SIZE equ 936
-MAX_TOPICS           equ 20
-
-; ---------------------------------------------------------------------------
-; Datos de solo lectura
-; ---------------------------------------------------------------------------
 section .data
 
-usage_msg    db  "Uso: ./broker_udp <puerto>", 10, 0
-err_socket   db  "Error: socket()", 10, 0
-err_bind     db  "Error: bind()", 10, 0
+uso         db "Uso: ./broker_udp <puerto>", 10, 0
+e_sock      db "Error: socket()", 10, 0
+e_bind      db "Error: bind()", 10, 0
 
-msg_start    db  "Broker UDP escuchando en puerto %d...", 10, 0
-msg_sub      db  "[Broker UDP] SUBSCRIBE tema='%s'", 10, 0
-msg_pub      db  "[Broker UDP] PUBLISH tema='%s' msg='%s'", 10, 0
-msg_fwd      db  "[Broker UDP] Reenviando a suscriptor #%d", 10, 0
-msg_unknown  db  "[Broker UDP] Mensaje desconocido", 10, 0
+fmt_start   db "Broker UDP escuchando en puerto %d...", 10, 0
+fmt_sub     db "[Broker] Suscriptor %s:%d suscrito a '%s'", 10, 0
+fmt_pub     db "[Broker] Publicando en '%s': %s -> %d suscriptor(es)", 10, 0
+fmt_nosubs  db "[Broker] Tema '%s' sin suscriptores", 10, 0
+fmt_unk     db "[Broker UDP] Mensaje desconocido", 10, 0
+fmt_fwd     db "[%s] %s", 0
 
-; Formato del mensaje reenviado al suscriptor
-fmt_forward  db  "[%s] %s", 0    ; sin \n — el broker UDP no agrega salto de linea
+opt_one     dd 1
 
-; ---------------------------------------------------------------------------
-; Datos no inicializados
-; ---------------------------------------------------------------------------
 section .bss
 
-sock_fd      resd 1
-port_num     resd 1
+sockfd      resd 1
+svaddr      resb 16
+from_addr   resb 16
+from_len    resd 1
+rbuf        resb BUF_SIZE
+fwd_buf     resb BUF_SIZE
+topics      resb MAX_TOPICS * ENTRY_SIZE
+num_topics  resd 1
 
-server_addr  resb SOCKADDR_IN_SIZE   ; direccion local del broker
-sender_addr  resb SOCKADDR_IN_SIZE   ; direccion del remitente actual
-sender_len   resd 1
-
-recv_buf     resb BUF_SIZE           ; buffer de recepcion
-fwd_buf      resb BUF_SIZE           ; buffer para mensaje reenviado
-
-; Tabla de temas UDP
-topic_table  resb MAX_TOPICS * UDP_TOPIC_ENTRY_SIZE
-num_topics   resd 1
-
-; ---------------------------------------------------------------------------
-; Codigo
-; ---------------------------------------------------------------------------
 section .text
 global main
 
 main:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    ; 6 pushes → rsp ≡ 8 (mod 16) → sub rsp,8
-    sub     rsp, 8
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
 
-    ; ---- Verificar argumentos ----
-    cmp     rdi, 2
-    jge     .args_ok
-    lea     rdi, [rel usage_msg]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+    cmp rdi, 2
+    jge .ok
+    lea rdi, [rel uso]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
-.args_ok:
-    mov     rbx, rsi
-    mov     rdi, [rbx + 8]      ; argv[1] = puerto
-    xor     eax, eax
-    call    atoi
-    mov     [rel port_num], eax
-    mov     r12d, eax           ; r12d = puerto
+.ok:
+    mov rbx, rsi
+    mov rdi, [rbx+8]
+    xor eax, eax
+    call atoi
+    mov r12d, eax   ; puerto
 
-    ; Inicializar tabla de temas a cero
-    lea     rdi, [rel topic_table]
-    xor     esi, esi
-    mov     edx, MAX_TOPICS * UDP_TOPIC_ENTRY_SIZE
-    call    memset
+    ; limpiar tabla de temas
+    lea rdi, [rel topics]
+    xor esi, esi
+    mov edx, MAX_TOPICS * ENTRY_SIZE
+    call memset
 
-    ; -------------------------------------------------------
-    ; 1. Crear socket UDP
-    ; -------------------------------------------------------
-    mov     edi, AF_INET
-    mov     esi, SOCK_DGRAM
-    xor     edx, edx
-    call    socket
-    cmp     eax, -1
-    je      .err_socket
-    movsxd  r13, eax            ; r13 = sock_fd
-    mov     [rel sock_fd], eax  ; guardar en memoria para udp_publish
+    mov edi, AF_INET
+    mov esi, SOCK_DGRAM
+    xor edx, edx
+    call socket
+    cmp eax, -1
+    je .err_sock
+    movsxd r13, eax
+    mov [rel sockfd], eax
 
-    ; -------------------------------------------------------
-    ; 2. Bind al puerto local
-    ; -------------------------------------------------------
-    lea     rdi, [rel server_addr]
-    xor     esi, esi
-    mov     edx, SOCKADDR_IN_SIZE
-    call    memset
+    ; reusar puerto si se reinicia
+    mov rdi, r13
+    mov esi, SOL_SOCKET
+    mov edx, SO_REUSEADDR
+    lea rcx, [rel opt_one]
+    mov r8d, 4
+    call setsockopt
 
-    mov     word  [rel server_addr], AF_INET
-    mov     dword [rel server_addr + 4], INADDR_ANY
+    lea rdi, [rel svaddr]
+    xor esi, esi
+    mov edx, 16
+    call memset
 
-    mov     edi, r12d
-    call    htons
-    mov     word [rel server_addr + 2], ax
+    mov word [rel svaddr], AF_INET
+    mov dword [rel svaddr+4], 0     ; INADDR_ANY
+    mov edi, r12d
+    call htons
+    mov word [rel svaddr+2], ax
 
-    mov     rdi, r13
-    lea     rsi, [rel server_addr]
-    mov     edx, SOCKADDR_IN_SIZE
-    call    bind
-    cmp     eax, -1
-    je      .err_bind
+    mov rdi, r13
+    lea rsi, [rel svaddr]
+    mov edx, 16
+    call bind
+    cmp eax, -1
+    je .err_bind
 
-    ; Anunciar que el broker esta listo
-    lea     rdi, [rel msg_start]
-    mov     esi, r12d
-    xor     eax, eax
-    call    printf
+    lea rdi, [rel fmt_start]
+    mov esi, r12d
+    xor eax, eax
+    call printf
 
-    ; -------------------------------------------------------
-    ; 3. Bucle principal: recibir datagramas y procesarlos
-    ; -------------------------------------------------------
-.recv_loop:
-    mov     dword [rel sender_len], SOCKADDR_IN_SIZE
+.recibir:
+    mov dword [rel from_len], 16
 
-    ; recvfrom(sockfd, recv_buf, BUF_SIZE-1, 0, &sender_addr, &sender_len)
-    mov     rdi, r13
-    lea     rsi, [rel recv_buf]
-    mov     edx, BUF_SIZE - 1
-    xor     ecx, ecx
-    lea     r8,  [rel sender_addr]
-    lea     r9,  [rel sender_len]
-    call    recvfrom
-    cmp     rax, 0
-    jl      .recv_loop          ; error transitorio
+    mov rdi, r13
+    lea rsi, [rel rbuf]
+    mov edx, BUF_SIZE-1
+    xor ecx, ecx
+    lea r8, [rel from_addr]
+    lea r9, [rel from_len]
+    call recvfrom
+    cmp rax, 0
+    jl .recibir
 
-    ; Terminar en nulo
-    lea     rbx, [rel recv_buf]
-    mov     byte [rbx + rax], 0
+    lea rbx, [rel rbuf]
+    mov byte [rbx+rax], 0
 
-    ; Procesar el mensaje
-    lea     rdi, [rel recv_buf]
-    call    process_udp_message
+    ; quitar \n si hay
+    lea rdi, [rel rbuf]
+    mov esi, 10
+    call strchr
+    test rax, rax
+    jz .procesar
+    mov byte [rax], 0
 
-    jmp     .recv_loop
+.procesar:
+    lea rdi, [rel rbuf]
+    call procesar_msg
 
-; --- Manejadores de error ---
-.err_socket:
-    lea     rdi, [rel err_socket]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+    jmp .recibir
+
+.err_sock:
+    lea rdi, [rel e_sock]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
 .err_bind:
-    lea     rdi, [rel err_bind]
-    xor     eax, eax
-    call    printf
-    mov     rdi, r13
-    call    close
-    mov     eax, 1
+    lea rdi, [rel e_bind]
+    xor eax, eax
+    call printf
+    mov rdi, r13
+    call close
+    mov eax, 1
 
-.exit:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.fin:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
-; =============================================================================
-; process_udp_message(rdi=msg_ptr)
-;   Analiza el mensaje y llama a udp_subscribe o udp_publish.
-; =============================================================================
-process_udp_message:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 8
 
-    mov     r12, rdi            ; r12 = puntero al mensaje
+; procesar_msg(rdi=msg)
+; decide si es SUBSCRIBE o PUBLISH
+procesar_msg:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
 
-    ; ¿Comienza con "SUBSCRIBE|"?
-    mov     rdi, r12
-    lea     rsi, [rel .str_subscribe]
-    mov     edx, 10
-    call    strncmp
-    test    eax, eax
-    jnz     .check_pub
+    mov r12, rdi
 
-    ; Extraer tema
-    mov     r13, r12
-    add     r13, 10             ; r13 = inicio del tema
+    mov rdi, r12
+    lea rsi, [rel .sub_str]
+    mov edx, 10
+    call strncmp
+    test eax, eax
+    jnz .ver_pub
 
-    ; Eliminar \n si existe
-    mov     rdi, r13
-    call    strlen
-    test    rax, rax
-    jz      .do_sub
-    lea     rbx, [r13 + rax - 1]
-    cmp     byte [rbx], 10
-    jne     .do_sub
-    mov     byte [rbx], 0
+    ; es SUBSCRIBE|tema
+    mov r13, r12
+    add r13, 10     ; saltar "SUBSCRIBE|"
 
-.do_sub:
-    ; Imprimir log
-    lea     rdi, [rel msg_sub]
-    mov     rsi, r13
-    xor     eax, eax
-    call    printf
+    mov rdi, r13
+    mov rsi, r13
+    lea rsi, [rel from_addr]
+    call hacer_sub
+    jmp .listo
 
-    ; Registrar suscripcion con la direccion del remitente
-    mov     rdi, r13
-    lea     rsi, [rel sender_addr]
-    call    udp_subscribe
-    jmp     .pum_done
+.ver_pub:
+    mov rdi, r12
+    lea rsi, [rel .pub_str]
+    mov edx, 8
+    call strncmp
+    test eax, eax
+    jnz .desconocido
 
-.check_pub:
-    ; ¿Comienza con "PUBLISH|"?
-    mov     rdi, r12
-    lea     rsi, [rel .str_publish]
-    mov     edx, 8
-    call    strncmp
-    test    eax, eax
-    jnz     .unknown
+    ; es PUBLISH|tema|msg
+    mov r13, r12
+    add r13, 8      ; saltar "PUBLISH|"
 
-    ; Extraer tema
-    mov     r13, r12
-    add     r13, 8              ; r13 = inicio del tema
+    ; buscar el segundo | para separar tema de mensaje
+    mov rbx, r13
+.buscar_pipe:
+    cmp byte [rbx], 0
+    je .desconocido
+    cmp byte [rbx], '|'
+    je .pipe_ok
+    inc rbx
+    jmp .buscar_pipe
 
-    ; Buscar el segundo '|' para separar tema de mensaje
-    mov     rbx, r13
-.find_pipe:
-    cmp     byte [rbx], 0
-    je      .unknown
-    cmp     byte [rbx], '|'
-    je      .pipe_found
-    inc     rbx
-    jmp     .find_pipe
+.pipe_ok:
+    mov byte [rbx], 0
+    inc rbx             ; rbx = inicio del mensaje
 
-.pipe_found:
-    mov     byte [rbx], 0      ; terminar tema
-    inc     rbx                ; rbx = inicio del mensaje
+    lea rdi, [rel fmt_pub]
+    mov rsi, r13
+    mov rdx, rbx
+    xor eax, eax
+    call printf
 
-    ; Eliminar \n final del mensaje si existe
-    mov     rdi, rbx
-    call    strlen
-    test    rax, rax
-    jz      .do_pub
-    lea     r14, [rbx + rax - 1]
-    cmp     byte [r14], 10
-    jne     .do_pub
-    mov     byte [r14], 0
+    mov rdi, r13
+    mov rsi, rbx
+    call hacer_pub
+    jmp .listo
 
-.do_pub:
-    ; Imprimir log
-    lea     rdi, [rel msg_pub]
-    mov     rsi, r13
-    mov     rdx, rbx
-    xor     eax, eax
-    call    printf
+.desconocido:
+    lea rdi, [rel fmt_unk]
+    xor eax, eax
+    call printf
 
-    ; Publicar el mensaje a los suscriptores del tema
-    mov     rdi, r13            ; tema
-    mov     rsi, rbx            ; mensaje
-    call    udp_publish
-    jmp     .pum_done
-
-.unknown:
-    lea     rdi, [rel msg_unknown]
-    xor     eax, eax
-    call    printf
-
-.pum_done:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.listo:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
-.str_subscribe: db "SUBSCRIBE|", 0
-.str_publish:   db "PUBLISH|", 0
+.sub_str: db "SUBSCRIBE|", 0
+.pub_str: db "PUBLISH|", 0
 
-; =============================================================================
-; udp_find_or_create_topic(rdi=topic_ptr) → rax = indice o -1
-; =============================================================================
-udp_find_or_create_topic:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    sub     rsp, 8
 
-    mov     r12, rdi            ; r12 = nombre del tema
-    xor     r13d, r13d          ; r13d = iterador
-    mov     r14d, -1            ; r14d = primer slot libre
+; buscar_tema(rdi=nombre) -> rax = indice en topics, o -1 si lleno
+buscar_tema:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
-.ufoct_loop:
-    cmp     r13d, MAX_TOPICS
-    jge     .ufoct_create
+    mov r12, rdi
+    xor r13d, r13d
+    mov r14d, -1    ; primer slot libre
 
-    ; Calcular puntero a entry[r13]
-    lea     rbx, [rel topic_table]
-    imul    rax, r13, UDP_TOPIC_ENTRY_SIZE
-    add     rbx, rax
+.loop:
+    cmp r13d, MAX_TOPICS
+    jge .crear
 
-    ; ¿Slot vacio?
-    cmp     byte [rbx], 0
-    jne     .ufoct_check
+    lea rbx, [rel topics]
+    imul rax, r13, ENTRY_SIZE
+    add rbx, rax
 
-    cmp     r14d, -1
-    jne     .ufoct_next
-    mov     r14d, r13d
-    jmp     .ufoct_next
+    cmp byte [rbx], 0
+    jne .comparar
 
-.ufoct_check:
-    mov     rdi, rbx
-    mov     rsi, r12
-    mov     edx, TOPIC_NAME_LEN
-    call    strncmp
-    test    eax, eax
-    jnz     .ufoct_next
+    ; slot vacio, guardar como candidato
+    cmp r14d, -1
+    jne .siguiente
+    mov r14d, r13d
+    jmp .siguiente
 
-    mov     eax, r13d           ; encontrado
-    jmp     .ufoct_ret
+.comparar:
+    mov rdi, rbx
+    mov rsi, r12
+    mov edx, TOPIC_NAME
+    call strncmp
+    test eax, eax
+    jnz .siguiente
+    mov eax, r13d
+    jmp .ret
 
-.ufoct_next:
-    inc     r13d
-    jmp     .ufoct_loop
+.siguiente:
+    inc r13d
+    jmp .loop
 
-.ufoct_create:
-    cmp     r14d, -1
-    je      .ufoct_fail
+.crear:
+    cmp r14d, -1
+    je .fallo
 
-    ; Crear en el slot libre
-    lea     rbx, [rel topic_table]
-    imul    rax, r14, UDP_TOPIC_ENTRY_SIZE
-    add     rbx, rax
+    lea rbx, [rel topics]
+    imul rax, r14, ENTRY_SIZE
+    add rbx, rax
 
-    mov     rdi, rbx
-    mov     rsi, r12
-    mov     edx, TOPIC_NAME_LEN - 1
-    call    strncpy
-    mov     byte [rbx + TOPIC_NAME_LEN - 1], 0
-    mov     dword [rbx + 928], 0    ; num_subs = 0
+    mov rdi, rbx
+    mov rsi, r12
+    mov edx, TOPIC_NAME-1
+    call strncpy
+    mov byte [rbx + TOPIC_NAME-1], 0
+    mov dword [rbx + 928], 0
 
-    mov     eax, [rel num_topics]
-    inc     eax
-    mov     [rel num_topics], eax
+    mov eax, [rel num_topics]
+    inc eax
+    mov [rel num_topics], eax
 
-    mov     eax, r14d
-    jmp     .ufoct_ret
+    mov eax, r14d
+    jmp .ret
 
-.ufoct_fail:
-    mov     eax, -1
+.fallo:
+    mov eax, -1
 
-.ufoct_ret:
-    add     rsp, 8
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
+.ret:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-; =============================================================================
-; udp_subscribe(rdi=topic_ptr, rsi=sender_sockaddr_ptr)
-;   Registra la direccion del remitente como suscriptor del tema.
-; =============================================================================
-udp_subscribe:
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    sub     rsp, 8
 
-    mov     r12, rdi            ; r12 = nombre del tema
-    mov     r13, rsi            ; r13 = puntero a sockaddr_in del remitente
+; hacer_sub(rdi=tema, rsi=&from_addr)
+hacer_sub:
+    push rbx
+    push r12
+    push r13
+    push r14
+    sub rsp, 8
 
-    ; Encontrar o crear el tema
-    mov     rdi, r12
-    call    udp_find_or_create_topic
-    cmp     eax, -1
-    je      .usub_done
+    mov r12, rdi    ; tema
+    mov r13, rsi    ; sockaddr del suscriptor
 
-    movsxd  rbx, eax
+    mov rdi, r12
+    call buscar_tema
+    cmp eax, -1
+    je .listo
 
-    ; Calcular puntero a la entrada
-    lea     r14, [rel topic_table]
-    imul    rax, rbx, UDP_TOPIC_ENTRY_SIZE
-    add     r14, rax            ; r14 = &topic_table[idx]
+    movsxd rbx, eax
+    lea r14, [rel topics]
+    imul rax, rbx, ENTRY_SIZE
+    add r14, rax    ; r14 = entrada del tema
 
-    ; Obtener num_subs
-    mov     ecx, [r14 + 928]
-    cmp     ecx, MAX_SUBS_PER_TOPIC
-    jge     .usub_done
+    mov ecx, [r14 + 928]
+    cmp ecx, MAX_SUBS
+    jge .listo
 
-    ; Verificar si ya esta registrado (comparar sockaddr_in completo)
-    xor     r8d, r8d
-.check_dup:
-    cmp     r8d, ecx
-    jge     .add_sub_udp
+    ; revisar si ya está suscrito
+    xor r8d, r8d
+.dup_check:
+    cmp r8d, ecx
+    jge .agregar
 
-    ; Calcular puntero al sockaddr_in en la tabla
-    lea     rax, [r14 + 128]
-    imul    rdx, r8, SOCKADDR_IN_SIZE
-    add     rax, rdx
+    lea rax, [r14 + 128]
+    imul rdx, r8, 16
+    add rax, rdx
 
-    mov     rdi, rax
-    mov     rsi, r13
-    mov     edx, SOCKADDR_IN_SIZE
-    call    memcmp
-    test    eax, eax
-    jz      .usub_done          ; ya registrado
+    mov rdi, rax
+    mov rsi, r13
+    mov edx, 16
+    call memcmp
+    test eax, eax
+    jz .listo   ; ya estaba
 
-    inc     r8d
-    mov     ecx, [r14 + 928]
-    jmp     .check_dup
+    inc r8d
+    mov ecx, [r14 + 928]
+    jmp .dup_check
 
-.add_sub_udp:
-    ; Copiar sockaddr_in al array (16 bytes = 2 qwords)
-    ; Calcular destino: &topic_table[idx].subs[num_subs]
-    lea     rbx, [r14 + 128]
-    imul    rax, rcx, SOCKADDR_IN_SIZE
-    add     rbx, rax                ; rbx = destino
+.agregar:
+    lea rbx, [r14 + 128]
+    imul rax, rcx, 16
+    add rbx, rax
 
-    ; Copiar 16 bytes desde sender_addr (r13) a destino (rbx)
-    mov     rax, [r13]
-    mov     [rbx], rax
-    mov     rax, [r13 + 8]
-    mov     [rbx + 8], rax
+    ; copiar 16 bytes del sockaddr_in
+    mov rax, [r13]
+    mov [rbx], rax
+    mov rax, [r13+8]
+    mov [rbx+8], rax
 
-    mov     ecx, [r14 + 928]
-    inc     ecx
-    mov     [r14 + 928], ecx
+    mov ecx, [r14 + 928]
+    inc ecx
+    mov [r14 + 928], ecx
 
-.usub_done:
-    add     rsp, 8
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
+    ; log: IP y puerto del nuevo suscriptor
+    mov edi, dword [r13+4]
+    call inet_ntoa
+
+    movzx edi, word [r13+2]
+    push rax
+    call ntohs
+    movzx edx, ax
+    pop rsi
+
+    lea rdi, [rel fmt_sub]
+    mov rcx, r12
+    xor eax, eax
+    call printf
+
+.listo:
+    add rsp, 8
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
-; =============================================================================
-; udp_publish(rdi=topic_ptr, rsi=msg_ptr)
-;   Reenviar "[tema] mensaje" a todos los suscriptores UDP del tema.
-; =============================================================================
-udp_publish:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    sub     rsp, 8
 
-    mov     r12, rdi            ; r12 = tema
-    mov     r13, rsi            ; r13 = mensaje
+; hacer_pub(rdi=tema, rsi=mensaje)
+hacer_pub:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
 
-    ; Buscar tema
-    mov     rdi, r12
-    call    udp_find_or_create_topic
-    cmp     eax, -1
-    je      .upub_done
+    mov r12, rdi    ; tema
+    mov r13, rsi    ; mensaje
 
-    movsxd  rbx, eax
+    mov rdi, r12
+    call buscar_tema
+    cmp eax, -1
+    je .listo
 
-    lea     r14, [rel topic_table]
-    imul    rax, rbx, UDP_TOPIC_ENTRY_SIZE
-    add     r14, rax            ; r14 = &topic_table[idx]
+    movsxd rbx, eax
+    lea r14, [rel topics]
+    imul rax, rbx, ENTRY_SIZE
+    add r14, rax
 
-    ; Construir mensaje reenviado en fwd_buf
-    lea     rdi, [rel fwd_buf]
-    mov     esi, BUF_SIZE
-    lea     rdx, [rel fmt_forward]
-    mov     rcx, r12
-    mov     r8,  r13
-    xor     eax, eax
-    call    snprintf
-    movsxd  r15, eax            ; r15 = longitud del mensaje reenviado
+    ; armar "[tema] mensaje" en fwd_buf
+    lea rdi, [rel fwd_buf]
+    mov esi, BUF_SIZE
+    lea rdx, [rel fmt_fwd]
+    mov rcx, r12
+    mov r8, r13
+    xor eax, eax
+    call snprintf
+    movsxd r15, eax
 
-    ; Recorrer suscriptores y enviar con sendto
-    mov     ecx, [r14 + 928]    ; num_subs
-    xor     r13d, r13d          ; r13d = iterador
+    mov ecx, [r14 + 928]
+    xor r13d, r13d  ; iterador
 
-.upub_loop:
-    cmp     r13d, ecx
-    jge     .upub_done
+.enviar:
+    cmp r13d, ecx
+    jge .listo
 
-    ; Imprimir log
-    push    rcx
-    lea     rdi, [rel msg_fwd]
-    mov     esi, r13d
-    xor     eax, eax
-    call    printf
-    pop     rcx
+    lea rax, [r14 + 128]
+    imul rdx, r13, 16
+    add rax, rdx
 
-    ; Calcular puntero al sockaddr_in del suscriptor
-    lea     rax, [r14 + 128]
-    imul    rdx, r13, SOCKADDR_IN_SIZE
-    add     rax, rdx            ; rax = &subs[r13d]
+    movsxd rdi, dword [rel sockfd]
+    lea rsi, [rel fwd_buf]
+    mov rdx, r15
+    xor ecx, ecx
+    mov r8, rax
+    mov r9d, 16
+    call sendto
 
-    ; sendto(sock_fd, fwd_buf, len, 0, &sub_addr, sizeof(sub_addr))
-    movsxd  rdi, dword [rel sock_fd]
-    lea     rsi, [rel fwd_buf]
-    mov     rdx, r15
-    xor     ecx, ecx
-    mov     r8,  rax
-    mov     r9d, SOCKADDR_IN_SIZE
-    call    sendto
+    inc r13d
+    mov ecx, [r14 + 928]
+    jmp .enviar
 
-    inc     r13d
-    mov     ecx, [r14 + 928]
-    jmp     .upub_loop
-
-.upub_done:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.listo:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret

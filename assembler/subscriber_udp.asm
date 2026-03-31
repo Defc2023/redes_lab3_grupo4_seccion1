@@ -1,277 +1,208 @@
-; =============================================================================
-; subscriber_udp.asm — Suscriptor UDP para el sistema de noticias deportivas
-; =============================================================================
+; subscriber_udp.asm
+; Suscriptor UDP - manda SUBSCRIBE y espera datagramas del broker
 ; Uso: ./subscriber_udp <ip> <puerto> <tema>
 ;
-; Descripcion:
-;   Envia una solicitud SUBSCRIBE|tema al broker por UDP,
-;   luego se queda en bucle recibiendo datagramas con recvfrom().
-;   Cada datagrama es independiente; no hay garantia de orden ni entrega.
-;
-; Protocolo (saliente): SUBSCRIBE|tema
-; Protocolo (entrante): [tema] mensaje
-;
-; Compilacion:
-;   nasm -f elf64 subscriber_udp.asm -o subscriber_udp.o
-;   gcc -no-pie subscriber_udp.o -o subscriber_udp
-; =============================================================================
+; nasm -f elf64 subscriber_udp.asm -o subscriber_udp.o
+; gcc -no-pie subscriber_udp.o -o subscriber_udp
 
 bits 64
 default rel
 
-; ---------------------------------------------------------------------------
-; Funciones de libc / POSIX
-; ---------------------------------------------------------------------------
-extern printf
-extern snprintf
-extern socket
-extern bind
-extern sendto
-extern recvfrom
-extern close
-extern atoi
-extern inet_addr
-extern htons
-extern memset
+extern printf, snprintf, socket, bind, sendto, recvfrom, close
+extern atoi, inet_addr, htons, memset
 
-; ---------------------------------------------------------------------------
-; Constantes
-; ---------------------------------------------------------------------------
 AF_INET    equ 2
 SOCK_DGRAM equ 2
+BUF_SIZE   equ 1024
 
-SOCKADDR_IN_SIZE equ 16
-BUF_SIZE         equ 1024
-INADDR_ANY       equ 0
-
-; ---------------------------------------------------------------------------
-; Datos de solo lectura
-; ---------------------------------------------------------------------------
 section .data
 
-usage_msg    db  "Uso: ./subscriber_udp <ip> <puerto> <tema>", 10, 0
-err_socket   db  "Error: no se pudo crear el socket UDP", 10, 0
-err_bind     db  "Error: bind() fallo", 10, 0
-err_sub      db  "Error al enviar SUBSCRIBE", 10, 0
+uso     db "Uso: ./subscriber_udp <ip> <puerto> <tema>", 10, 0
+e_sock  db "Error creando socket UDP", 10, 0
+e_bind  db "Error en bind()", 10, 0
+e_sub   db "Error enviando SUBSCRIBE", 10, 0
 
-fmt_start    db  "=== Suscriptor UDP en puerto %d, tema: %s ===", 10, 0
-fmt_sub_sent db  "[Sub UDP] Suscripcion enviada: %s", 10, 0
-fmt_waiting  db  "Esperando actualizaciones...", 10, 0
-fmt_recv     db  "  #%d %s", 10, 0
+fmt_sub  db "SUBSCRIBE|%s", 0
+fmt_ok   db "[Sub UDP] Suscripcion enviada: %s", 10, 0
+fmt_ini  db "=== Suscriptor UDP en puerto %d, tema: %s ===", 10, 0
+fmt_wait db "Esperando actualizaciones...", 10, 0
+fmt_msg  db "  #%d %s", 10, 0
 
-fmt_sub_msg  db  "SUBSCRIBE|%s", 0   ; mensaje de suscripcion sin \n (UDP)
-
-; ---------------------------------------------------------------------------
-; Datos no inicializados
-; ---------------------------------------------------------------------------
 section .bss
 
-sock_fd      resd 1
-sub_buf      resb BUF_SIZE    ; buffer para mensaje SUBSCRIBE
-recv_buf     resb BUF_SIZE    ; buffer para mensajes entrantes
-broker_addr  resb SOCKADDR_IN_SIZE   ; direccion del broker
-local_addr   resb SOCKADDR_IN_SIZE   ; direccion local para bind
-sender_addr  resb SOCKADDR_IN_SIZE   ; direccion del remitente (recvfrom)
-sender_len   resd 1                  ; longitud del remitente
+sockfd      resd 1
+sub_buf     resb BUF_SIZE
+rbuf        resb BUF_SIZE
+braddr      resb 16   ; direccion del broker
+laddr       resb 16   ; direccion local para bind
+from_addr   resb 16   ; de donde vino el datagrama
+from_len    resd 1
+contador    resd 1
 
-msg_count    resd 1                  ; contador de mensajes recibidos
-
-; ---------------------------------------------------------------------------
-; Codigo
-; ---------------------------------------------------------------------------
 section .text
 global main
 
 main:
-    push    rbp
-    push    rbx
-    push    r12
-    push    r13
-    push    r14
-    push    r15
-    ; 6 pushes → rsp ≡ 8 (mod 16) → sub rsp,8
-    sub     rsp, 8
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
 
-    ; ---- Verificar argumentos ----
-    cmp     rdi, 4
-    jge     .args_ok
-    lea     rdi, [rel usage_msg]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+    cmp rdi, 4
+    jge .ok
+    lea rdi, [rel uso]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
-.args_ok:
-    mov     rbx, rsi            ; rbx = argv
+.ok:
+    mov rbx, rsi
+    mov r12, [rbx+8]    ; IP del broker
+    mov rdi, [rbx+16]
+    xor eax, eax
+    call atoi
+    movsx r13, eax      ; puerto
+    mov r14, [rbx+24]   ; tema
 
-    mov     r12, [rbx + 8]      ; r12 = argv[1] = IP del broker
-    mov     rdi, [rbx + 16]     ; argv[2] = puerto
-    xor     eax, eax
-    call    atoi
-    movsx   r13, eax            ; r13 = puerto
-    mov     r14, [rbx + 24]     ; r14 = argv[3] = tema
+    mov edi, AF_INET
+    mov esi, SOCK_DGRAM
+    xor edx, edx
+    call socket
+    cmp eax, -1
+    je .err_sock
+    movsxd rbp, eax
 
-    ; -------------------------------------------------------
-    ; 1. Crear socket UDP
-    ; -------------------------------------------------------
-    mov     edi, AF_INET
-    mov     esi, SOCK_DGRAM
-    xor     edx, edx
-    call    socket
-    cmp     eax, -1
-    je      .err_socket
-    movsxd  rbp, eax            ; rbp = sock_fd
+    ; bind en puerto efimero para que el broker sepa donde responder
+    lea rdi, [rel laddr]
+    xor esi, esi
+    mov edx, 16
+    call memset
 
-    ; -------------------------------------------------------
-    ; 2. Bind en puerto efimero local para recibir datagramas de vuelta
-    ;    El broker necesita saber desde que direccion llegamos para
-    ;    enviar los mensajes de vuelta al suscriptor.
-    ;    bind(sockfd, {AF_INET, 0, INADDR_ANY}, 16)
-    ;    Puerto 0 → el kernel asigna un puerto libre automaticamente.
-    ; -------------------------------------------------------
-    lea     rdi, [rel local_addr]
-    xor     esi, esi
-    mov     edx, SOCKADDR_IN_SIZE
-    call    memset
+    mov word [rel laddr], AF_INET
+    ; puerto 0 = el kernel asigna uno libre
+    mov word [rel laddr+2], 0
+    mov dword [rel laddr+4], 0   ; INADDR_ANY
 
-    mov     word  [rel local_addr], AF_INET
-    mov     word  [rel local_addr + 2], 0      ; puerto 0 = asignacion automatica
-    mov     dword [rel local_addr + 4], INADDR_ANY
+    mov rdi, rbp
+    lea rsi, [rel laddr]
+    mov edx, 16
+    call bind
+    cmp eax, -1
+    je .err_bind
 
-    mov     rdi, rbp
-    lea     rsi, [rel local_addr]
-    mov     edx, SOCKADDR_IN_SIZE
-    call    bind
-    cmp     eax, -1
-    je      .err_bind
+    ; armar sockaddr_in del broker
+    lea rdi, [rel braddr]
+    xor esi, esi
+    mov edx, 16
+    call memset
 
-    ; -------------------------------------------------------
-    ; 3. Construir sockaddr_in del broker
-    ; -------------------------------------------------------
-    lea     rdi, [rel broker_addr]
-    xor     esi, esi
-    mov     edx, SOCKADDR_IN_SIZE
-    call    memset
+    mov word [rel braddr], AF_INET
+    mov edi, r13d
+    call htons
+    mov word [rel braddr+2], ax
+    mov rdi, r12
+    call inet_addr
+    mov dword [rel braddr+4], eax
 
-    mov     word [rel broker_addr], AF_INET
+    ; enviar SUBSCRIBE|tema al broker
+    lea rdi, [rel sub_buf]
+    mov esi, BUF_SIZE
+    lea rdx, [rel fmt_sub]
+    mov rcx, r14
+    xor eax, eax
+    call snprintf
+    movsxd r15, eax
 
-    mov     edi, r13d
-    call    htons
-    mov     word [rel broker_addr + 2], ax
+    mov rdi, rbp
+    lea rsi, [rel sub_buf]
+    mov rdx, r15
+    xor ecx, ecx
+    lea r8, [rel braddr]
+    mov r9d, 16
+    call sendto
+    cmp rax, -1
+    je .err_sub
 
-    mov     rdi, r12
-    call    inet_addr
-    mov     dword [rel broker_addr + 4], eax
+    lea rdi, [rel fmt_ok]
+    mov rsi, r14
+    xor eax, eax
+    call printf
 
-    ; -------------------------------------------------------
-    ; 4. Enviar solicitud de suscripcion SUBSCRIBE|tema
-    ;    sendto(sockfd, sub_buf, len, 0, &broker_addr, sizeof(broker_addr))
-    ; -------------------------------------------------------
-    lea     rdi, [rel sub_buf]
-    mov     esi, BUF_SIZE
-    lea     rdx, [rel fmt_sub_msg]
-    mov     rcx, r14
-    xor     eax, eax
-    call    snprintf
-    movsxd  r15, eax            ; r15 = longitud del mensaje
+    lea rdi, [rel fmt_ini]
+    mov esi, r13d
+    mov rdx, r14
+    xor eax, eax
+    call printf
 
-    mov     rdi, rbp
-    lea     rsi, [rel sub_buf]
-    mov     rdx, r15
-    xor     ecx, ecx
-    lea     r8, [rel broker_addr]
-    mov     r9d, SOCKADDR_IN_SIZE
-    call    sendto
-    cmp     rax, -1
-    je      .err_sub
+    lea rdi, [rel fmt_wait]
+    xor eax, eax
+    call printf
 
-    ; Imprimir confirmacion
-    lea     rdi, [rel fmt_sub_sent]
-    mov     rsi, r14
-    xor     eax, eax
-    call    printf
+    mov dword [rel contador], 0
 
-    ; Imprimir encabezado de espera
-    lea     rdi, [rel fmt_start]
-    mov     esi, r13d
-    mov     rdx, r14
-    xor     eax, eax
-    call    printf
+    ; bucle: recibir datagramas del broker
+.recibir:
+    mov dword [rel from_len], 16
 
-    lea     rdi, [rel fmt_waiting]
-    xor     eax, eax
-    call    printf
+    mov rdi, rbp
+    lea rsi, [rel rbuf]
+    mov edx, BUF_SIZE-1
+    xor ecx, ecx
+    lea r8, [rel from_addr]
+    lea r9, [rel from_len]
+    call recvfrom
+    cmp rax, 0
+    jl .recibir   ; error transitorio, ignorar
 
-    ; Inicializar contador de mensajes
-    mov     dword [rel msg_count], 0
+    lea rbx, [rel rbuf]
+    mov byte [rbx+rax], 0
 
-    ; -------------------------------------------------------
-    ; 5. Bucle de recepcion de datagramas
-    ;    recvfrom(sockfd, buf, size, 0, &sender_addr, &sender_len)
-    ;    Cada llamada bloquea hasta recibir un datagrama.
-    ; -------------------------------------------------------
-.recv_loop:
-    mov     dword [rel sender_len], SOCKADDR_IN_SIZE
+    mov eax, [rel contador]
+    inc eax
+    mov [rel contador], eax
 
-    mov     rdi, rbp
-    lea     rsi, [rel recv_buf]
-    mov     edx, BUF_SIZE - 1
-    xor     ecx, ecx                   ; flags = 0
-    lea     r8,  [rel sender_addr]
-    lea     r9,  [rel sender_len]
-    call    recvfrom
-    cmp     rax, 0
-    jl      .recv_loop                 ; error transitorio, continuar
+    lea rdi, [rel fmt_msg]
+    mov esi, eax
+    lea rdx, [rel rbuf]
+    xor eax, eax
+    call printf
 
-    ; Terminar en nulo
-    lea     rbx, [rel recv_buf]
-    mov     byte [rbx + rax], 0
+    jmp .recibir
 
-    ; Incrementar y obtener numero de mensaje
-    mov     eax, [rel msg_count]
-    inc     eax
-    mov     [rel msg_count], eax
-
-    ; Imprimir: "  #N mensaje"
-    lea     rdi, [rel fmt_recv]
-    mov     esi, eax
-    lea     rdx, [rel recv_buf]
-    xor     eax, eax
-    call    printf
-
-    jmp     .recv_loop
-
-; --- Manejadores de error ---
-.err_socket:
-    lea     rdi, [rel err_socket]
-    xor     eax, eax
-    call    printf
-    mov     eax, 1
-    jmp     .exit
+.err_sock:
+    lea rdi, [rel e_sock]
+    xor eax, eax
+    call printf
+    mov eax, 1
+    jmp .fin
 
 .err_bind:
-    lea     rdi, [rel err_bind]
-    xor     eax, eax
-    call    printf
-    mov     rdi, rbp
-    call    close
-    mov     eax, 1
-    jmp     .exit
+    lea rdi, [rel e_bind]
+    xor eax, eax
+    call printf
+    mov rdi, rbp
+    call close
+    mov eax, 1
+    jmp .fin
 
 .err_sub:
-    lea     rdi, [rel err_sub]
-    xor     eax, eax
-    call    printf
-    mov     rdi, rbp
-    call    close
-    mov     eax, 1
+    lea rdi, [rel e_sub]
+    xor eax, eax
+    call printf
+    mov rdi, rbp
+    call close
+    mov eax, 1
 
-.exit:
-    add     rsp, 8
-    pop     r15
-    pop     r14
-    pop     r13
-    pop     r12
-    pop     rbx
-    pop     rbp
+.fin:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
