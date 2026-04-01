@@ -11,29 +11,21 @@ Sistema pub-sub de noticias deportivas implementado con tres protocolos de trans
 
 ```
 redes_lab3/
-├── implC/                          # Implementaciones en C
-│   ├── broker_tcp.c
-│   ├── publisher_tcp.c
-│   ├── subscriber_tcp.c
-│   ├── broker_udp.c
-│   ├── publisher_udp.c
-│   ├── subscriber_udp.c
-│   ├── broker_quic.c
-│   ├── publisher_quic.c
-│   ├── subscriber_quic.c
-│   ├── tcp_pubsub.pcap
-│   ├── udp_pubsub.pcap
-│   └── quic_pubsub.pcap
-├── assembler/                      # Bono: implementacion en NASM x86-64
-│   ├── broker_tcp.asm
-│   ├── publisher_tcp.asm
-│   ├── subscriber_tcp.asm
-│   ├── broker_udp.asm
-│   ├── publisher_udp.asm
-│   ├── subscriber_udp.asm
-│   └── Makefile
-├── redes_lab3_enunciado.pdf
-├── redes_lab3_grupo4_informe.pdf
+├── implementacion_c/               # Implementaciones en C
+│   ├── broker_tcp.c                # Broker TCP
+│   ├── publisher_tcp.c             # Publicador TCP
+│   ├── subscriber_tcp.c            # Suscriptor TCP
+│   ├── broker_udp.c                # Broker UDP
+│   ├── publisher_udp.c             # Publicador UDP
+│   ├── subscriber_udp.c            # Suscriptor UDP
+│   ├── broker_quic.c               # Broker QUIC hibrido
+│   ├── publisher_quic.c            # Publicador QUIC hibrido
+│   ├── subscriber_quic.c           # Suscriptor QUIC hibrido
+│   ├── tcp_pubsub.pcap             # Captura Wireshark TCP
+│   ├── udp_pubsub.pcap             # Captura Wireshark UDP
+│   └── quic_pubsub.pcap            # Captura Wireshark QUIC
+├── redes_lab3_enunciado.pdf        # Enunciado del laboratorio
+├── redes_lab3_grupo4_informe.pdf   # Informe final
 └── README.md
 ```
 
@@ -120,86 +112,6 @@ Cada protocolo necesita 1 broker, 2 publishers y 2 subscribers (uno suscrito a 2
 Para TCP y QUIC es igual pero con los ejecutables correspondientes y los puertos 5555 (TCP) y 5557 (QUIC).
 
 Los subscribers se detienen con `Ctrl+C` una vez que ambos publishers terminan de enviar.
-
-## Bono: Implementacion en Ensamblador x86-64
-
-Los mismos 6 componentes TCP y UDP estan reimplementados en NASM (ensamblador x86-64) dentro de la carpeta `assembler/`. QUIC no fue reescrito en ASM ya que el enunciado lo permite.
-
-### Estructura
-
-```
-assembler/
-├── broker_tcp.asm
-├── publisher_tcp.asm
-├── subscriber_tcp.asm
-├── broker_udp.asm
-├── publisher_udp.asm
-├── subscriber_udp.asm
-└── Makefile
-```
-
-### Librerias usadas
-
-Los archivos ASM **no usan ninguna libreria externa especial**. Solo llaman funciones de la libreria estandar de C (libc) mediante `extern`, exactamente igual que lo haria un programa en C compilado con gcc. La siguiente tabla lista todas las funciones usadas y donde se usan:
-
-| Funcion | Header de origen | Usada en |
-|---|---|---|
-| `printf`, `snprintf` | `<stdio.h>` | todos los archivos (mensajes en pantalla) |
-| `socket`, `bind`, `listen`, `accept` | `<sys/socket.h>` | brokers TCP y UDP |
-| `connect`, `send`, `recv` | `<sys/socket.h>` | publisher/subscriber TCP |
-| `sendto`, `recvfrom` | `<sys/socket.h>` | publisher/subscriber/broker UDP |
-| `setsockopt` | `<sys/socket.h>` | broker UDP (SO_REUSEADDR) |
-| `select` | `<sys/select.h>` | broker TCP (multiplexado sin hilos) |
-| `close` | `<unistd.h>` | todos los archivos |
-| `write` | `<unistd.h>` | subscriber TCP (escribe a stdout) |
-| `sleep`, `usleep` | `<unistd.h>` | publisher TCP (2s) y UDP (5ms) entre eventos |
-| `htons`, `ntohs` | `<arpa/inet.h>` | todos (convertir orden de bytes de red) |
-| `inet_addr`, `inet_ntoa` | `<arpa/inet.h>` | brokers (IP texto ↔ binario) |
-| `atoi` | `<stdlib.h>` | todos (convertir puerto de argv a entero) |
-| `memset`, `memcmp` | `<string.h>` | brokers (inicializar y comparar sockaddr_in) |
-| `strncmp`, `strncpy`, `strlen`, `strchr` | `<string.h>` | brokers (parsear mensajes SUBSCRIBE/PUBLISH) |
-
-> Todos estos simbolos son resueltos en tiempo de enlace por gcc con la libc del sistema. No se necesita instalar nada adicional.
-
-### Compilacion (Linux x86-64)
-
-Requiere `nasm` y `gcc`. En macOS con chip Apple Silicon se usa Docker:
-
-```bash
-# instalar nasm en Linux/Docker
-apt-get install nasm
-
-# compilar todo
-cd assembler/
-make
-
-# o individualmente
-nasm -f elf64 broker_tcp.asm -o broker_tcp.o
-gcc -no-pie broker_tcp.o -o broker_tcp
-```
-
-### Ejecucion
-
-Identica a la version en C. Ejemplo TCP:
-
-```bash
-# Terminal 1
-./broker_tcp 5555
-
-# Terminal 2
-./subscriber_tcp 127.0.0.1 5555 futbol
-
-# Terminal 3
-./publisher_tcp 127.0.0.1 5555 futbol
-```
-
-### Detalles de implementacion
-
-- **Convencion de llamada**: System V AMD64 ABI. Argumentos en `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`. Retorno en `rax`. Registros callee-saved: `rbx`, `rbp`, `r12`–`r15`.
-- **Alineacion de pila**: cada funcion ajusta `rsp` para garantizar alineacion a 16 bytes antes de cualquier `call`, como exige la ABI.
-- **fd_set manual**: el broker TCP implementa `FD_SET`, `FD_CLR` e `FD_ISSET` directamente con operaciones de bits sobre los 128 bytes de la estructura, sin macros de libc.
-- **Tabla de temas TCP**: cada entrada ocupa 336 bytes (128 nombre + 200 array de fds + 4 contador + 4 padding).
-- **Tabla de temas UDP**: cada entrada ocupa 936 bytes (128 nombre + 800 array de sockaddr_in + 4 contador + 4 padding).
 
 ## Capturas Wireshark
 
